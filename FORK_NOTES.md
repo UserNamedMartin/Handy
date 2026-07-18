@@ -81,22 +81,49 @@ bun run tauri build      # release .app + .dmg  → src-tauri/target/release/bun
 ```bash
 # 1. quit any running instance (single-instance: a stale process hijacks the launch)
 osascript -e 'tell application "Handy" to quit'; pkill -f "Handy.app/Contents/MacOS/handy"
-# 2. if the official build was installed via Homebrew, remove it so it can't auto-update over ours
+# 2. (first time only) if the official build was installed via Homebrew, remove it
 brew uninstall --cask handy 2>/dev/null || true
 # 3. install
+rm -rf /Applications/Handy.app
 cp -R src-tauri/target/release/bundle/macos/Handy.app /Applications/
+# 4. RE-SIGN with the stable local cert — REQUIRED every rebuild to keep TCC grants
+codesign --force --deep \
+  --sign D01CBC8B3BE2C8661FBB4A4E7BECE27061FEEB35 \
+  --keychain "$HOME/Library/Keychains/handy-signing.keychain-db" \
+  /Applications/Handy.app
 xattr -cr /Applications/Handy.app
+open /Applications/Handy.app
 ```
 
-### ⚠️ Permissions after replacing (important — this bit Martin once)
-Our build is **ad-hoc signed** — a different signature from the official build. macOS ties
-Accessibility/Microphone (TCC) permissions to the signature, so replacing the app leaves
-**stale/duplicate "Handy" entries** and permissions silently stop working. After installing:
+### Stable code-signing (why there are no more permission re-grants)
+Ad-hoc signing changes the app's identity on every build, which resets macOS
+Accessibility/Microphone (TCC) grants. This fork is signed with a **stable self-signed
+certificate**, so the designated requirement
+(`identifier "com.pais.handy" and certificate leaf = H"d01cbc8b…"`) never changes —
+grant permissions **once** and every future rebuild keeps them. **Always re-sign with
+this cert (step 4 above) after copying a new build.**
+
+- Identity: `Handy Dev (Martin)`, SHA-1 `D01CBC8B3BE2C8661FBB4A4E7BECE27061FEEB35`
+- Keychain: `~/Library/Keychains/handy-signing.keychain-db` (password `handydev`)
+- Cert/key backup (outside the repo): `~/tools-for-agents/.handy-signing/`
+
+**First-time only:** self-signed apps fail Gatekeeper assessment (`spctl` → "rejected"),
+but a locally-built app still launches — the first launch may need Right-click → Open (or
+System Settings → Privacy & Security → "Open Anyway"). Then enable **Handy** under
+**Accessibility** and **Microphone**. Not needed again on later rebuilds.
+
+**If the signing keychain is ever lost**, re-import the *same* cert to keep the identity
+(and your grants) stable:
 ```bash
-tccutil reset All com.pais.handy
+security create-keychain -p handydev ~/Library/Keychains/handy-signing.keychain-db
+security unlock-keychain  -p handydev ~/Library/Keychains/handy-signing.keychain-db
+security import ~/tools-for-agents/.handy-signing/handy.p12 \
+  -k ~/Library/Keychains/handy-signing.keychain-db -P handy -A -T /usr/bin/codesign
+security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k handydev \
+  ~/Library/Keychains/handy-signing.keychain-db
+security list-keychains -d user -s ~/Library/Keychains/handy-signing.keychain-db \
+  $(security list-keychains -d user | sed -e 's/"//g')
 ```
-Then open Handy and grant **Accessibility** + **Microphone** fresh in
-System Settings → Privacy & Security.
 
 **Don't leave the build-copy around.** `src-tauri/target/release/bundle/macos/Handy.app`
 shows up in Spotlight as a second "Handy". Deleting `src-tauri/target/release/bundle/` is
