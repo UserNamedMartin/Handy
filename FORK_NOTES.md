@@ -18,19 +18,29 @@ Branch: `feat/per-binding-activation-mode`
 
 Upstream has a single global `push_to_talk` flag that forces **every** transcribe
 binding into hold-to-talk (`true`) or toggle (`false`). This fork lets **each binding
-choose its own mode**, and ships a second transcribe binding so a hold-to-talk key
-**and** a hands-free toggle key work at the same time.
+choose its own mode** via `ActivationMode { Global, PushToTalk, Toggle, Hybrid }`,
+and ships a second transcribe binding.
+
+`Hybrid` = the "Wispr Flow" one-key experience: **hold** to talk (push-to-talk),
+**double-tap** to lock hands-free recording, **tap** once more to stop. Implemented in
+the coordinator via `evaluate_hybrid` + a double-tap-window timeout.
 
 Default behaviour after this change:
-- `transcribe` → `ActivationMode::Global` (follows the global Push-To-Talk toggle; default = hold).
+- `transcribe` → `ActivationMode::Hybrid` (hold, or double-tap to latch hands-free).
 - `transcribe_toggle` → `ActivationMode::Toggle` (press once = start, press again = stop). Default key `ctrl+option+space` on macOS.
+- `Global` still follows the app-wide Push-To-Talk toggle (used by `transcribe_with_post_process`).
 
 Files touched (keep them consistent if you extend this):
-- `src-tauri/src/settings.rs` — `enum ActivationMode { Global, PushToTalk, Toggle }` (+ `resolve(global_ptt) -> bool`), `activation_mode` field on `ShortcutBinding` (`#[serde(default)]` → `Global` for old stores), and the new default `transcribe_toggle` binding. New default bindings are auto-back-filled into existing settings stores by the merge in `get_settings()`.
-- `src-tauri/src/shortcut/handler.rs` — resolves the effective push-to-talk boolean **per binding** (`binding.activation_mode.resolve(settings.push_to_talk)`) instead of always reading the global flag.
-- `src-tauri/src/transcription_coordinator.rs` — `is_transcribe_binding()` also matches `transcribe_toggle`. **The coordinator itself is deliberately unchanged** — it already takes a `push_to_talk` bool per call and tracks which binding owns the recording via `Stage::Recording(id)`, so two bindings coexist (only one records at a time).
+- `src-tauri/src/settings.rs` — `enum ActivationMode { Global, PushToTalk, Toggle, Hybrid }` with `resolve(global_ptt) -> ActivationMode` (maps `Global` → PushToTalk/Toggle; never returns `Global`); `activation_mode` field on `ShortcutBinding` (`#[serde(default)]` → `Global` for old stores); `transcribe` default is `Hybrid`; new default `transcribe_toggle` binding. New default bindings are auto-back-filled into existing settings stores by the merge in `get_settings()`.
+- `src-tauri/src/shortcut/handler.rs` — resolves each binding's `ActivationMode` and passes it to the coordinator instead of the global bool.
+- `src-tauri/src/transcription_coordinator.rs` — `send_input`/`Command::Input` now carry an `ActivationMode`. `PushToTalk`/`Toggle` use the existing logic; `Hybrid` runs `evaluate_hybrid` (hold vs quick-tap vs double-tap-latch) with the double-tap window enforced by the coordinator loop's timeout. `is_transcribe_binding()` also matches `transcribe_toggle`. Unit tests cover hold / double-tap-latch / lone-tap. Single-slot `Stage` means only one binding records at a time.
+- `src-tauri/src/signal_handle.rs` — CLI/signal triggers send `ActivationMode::Toggle`.
 - `src-tauri/src/actions.rs` — `ACTION_MAP` maps `transcribe_toggle` → `TranscribeAction { post_process: false }`.
 - `src/components/settings/general/GeneralSettings.tsx` — renders a second `<ShortcutInput shortcutId="transcribe_toggle" />`. Labels fall back to the binding's Rust `name`/`description` via `t(key, defaultValue)`.
+
+### Tuning the Hybrid feel
+`HOLD_THRESHOLD` (300 ms — hold vs tap) and `DOUBLE_TAP_WINDOW` (400 ms — max gap
+between taps) are consts at the top of `transcription_coordinator.rs`.
 
 To expose a per-binding mode **dropdown** in the UI later: add a Tauri command mirroring `change_ptt_setting` (in `shortcut/mod.rs`), register it in `lib.rs` `collect_commands!`, then run a debug build to regenerate `src/bindings.ts`.
 

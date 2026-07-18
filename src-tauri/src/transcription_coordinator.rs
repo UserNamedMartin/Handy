@@ -1,5 +1,6 @@
 use crate::actions::ACTION_MAP;
 use crate::managers::audio::AudioRecordingManager;
+use crate::settings::ActivationMode;
 use log::{debug, error, warn};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
@@ -29,7 +30,7 @@ enum Command {
         binding_id: String,
         hotkey_string: String,
         is_pressed: bool,
-        push_to_talk: bool,
+        mode: ActivationMode,
     },
     Cancel {
         recording_was_active: bool,
@@ -68,6 +69,110 @@ fn classify_ptt_event(
     }
 }
 
+/// How long a key must be held for a Hybrid-mode press to count as
+/// "hold-to-talk" rather than a tap.
+const HOLD_THRESHOLD: Duration = Duration::from_millis(300);
+/// Max gap between the first tap's release and the second press for a
+/// Hybrid-mode double-tap to latch hands-free recording.
+const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(400);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HybridAction {
+    None,
+    Start,
+    Stop,
+}
+
+/// State for a Hybrid-mode binding (hold-to-talk + double-tap-to-latch).
+#[derive(Default)]
+struct HybridState {
+    /// If a quick tap just happened, when the double-tap window closes. While
+    /// set, recording is running but not yet committed to hold or latch.
+    pending_tap_deadline: Option<Instant>,
+    /// Recording is locked hands-free (started by a double-tap).
+    latched: bool,
+    /// When the current recording's initiating press happened (to measure hold).
+    press_start: Option<Instant>,
+    /// Binding/hotkey owning the current Hybrid recording, so a lone-tap timeout
+    /// can stop it without a live key event.
+    binding_id: Option<String>,
+    hotkey_string: Option<String>,
+}
+
+impl HybridState {
+    fn reset(&mut self) {
+        *self = HybridState::default();
+    }
+}
+
+/// Decide what a Hybrid-mode press/release should do, mutating hybrid state.
+///
+/// - Press while idle -> start recording (could become a hold, a lone tap, or
+///   the first tap of a double-tap).
+/// - Release of a long press -> stop (hold-to-talk).
+/// - Release of a quick tap -> keep recording, open the double-tap window.
+/// - Second press within the window -> latch hands-free (keep recording).
+/// - Press while latched -> stop (tap to finish).
+///
+/// A lone quick tap whose window expires with no second press is stopped by the
+/// coordinator loop's timeout handling.
+fn evaluate_hybrid(
+    hybrid: &mut HybridState,
+    stage: &Stage,
+    binding_id: &str,
+    is_pressed: bool,
+    now: Instant,
+    hold_threshold: Duration,
+    double_tap_window: Duration,
+) -> HybridAction {
+    if is_pressed {
+        match stage {
+            Stage::Idle => {
+                hybrid.press_start = Some(now);
+                hybrid.latched = false;
+                hybrid.pending_tap_deadline = None;
+                HybridAction::Start
+            }
+            Stage::Recording(id) if id == binding_id => {
+                if hybrid.latched {
+                    // Tap to finish a hands-free (latched) recording.
+                    HybridAction::Stop
+                } else if hybrid.pending_tap_deadline.is_some_and(|d| now <= d) {
+                    // Second tap within the window -> latch, keep recording.
+                    hybrid.latched = true;
+                    hybrid.pending_tap_deadline = None;
+                    HybridAction::None
+                } else {
+                    // Extra press while already holding (e.g. key auto-repeat).
+                    HybridAction::None
+                }
+            }
+            _ => HybridAction::None,
+        }
+    } else {
+        match stage {
+            Stage::Recording(id) if id == binding_id && !hybrid.latched => {
+                let held = hybrid
+                    .press_start
+                    .map(|t| now.saturating_duration_since(t))
+                    .unwrap_or(Duration::ZERO);
+                if held >= hold_threshold {
+                    // Genuine hold -> stop & insert.
+                    hybrid.pending_tap_deadline = None;
+                    hybrid.press_start = None;
+                    HybridAction::Stop
+                } else {
+                    // Quick tap: keep recording and wait for a possible second
+                    // tap (double-tap to latch).
+                    hybrid.pending_tap_deadline = Some(now + double_tap_window);
+                    HybridAction::None
+                }
+            }
+            _ => HybridAction::None,
+        }
+    }
+}
+
 /// Serialises all transcription lifecycle events through a single thread
 /// to eliminate race conditions between keyboard shortcuts, signals, and
 /// the async transcribe-paste pipeline.
@@ -88,23 +193,57 @@ impl TranscriptionCoordinator {
                 let mut stage = Stage::Idle;
                 let mut last_press: Option<Instant> = None;
                 let mut pending_release: Option<PendingRelease> = None;
+                let mut hybrid = HybridState::default();
 
                 loop {
-                    let cmd = if let Some(pending) = &pending_release {
-                        match rx.recv_timeout(
-                            pending.deadline.saturating_duration_since(Instant::now()),
-                        ) {
+                    // Wake for the soonest pending deadline: a deferred
+                    // push-to-talk release (X11 auto-repeat grace) or a Hybrid
+                    // double-tap window waiting for a possible second tap.
+                    let next_deadline = [
+                        pending_release.as_ref().map(|p| p.deadline),
+                        hybrid.pending_tap_deadline,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .min();
+
+                    let cmd = if let Some(deadline) = next_deadline {
+                        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                             Ok(cmd) => cmd,
                             Err(mpsc::RecvTimeoutError::Timeout) => {
-                                if let Some(pending) = pending_release.take() {
-                                    if matches!(&stage, Stage::Recording(id) if id == &pending.binding_id)
-                                    {
-                                        stop(
-                                            &app,
-                                            &mut stage,
-                                            &pending.binding_id,
-                                            &pending.hotkey_string,
-                                        );
+                                let now = Instant::now();
+
+                                // Deferred push-to-talk release fires.
+                                if pending_release.as_ref().is_some_and(|p| now >= p.deadline) {
+                                    if let Some(pending) = pending_release.take() {
+                                        if matches!(&stage, Stage::Recording(id) if id == &pending.binding_id)
+                                        {
+                                            stop(
+                                                &app,
+                                                &mut stage,
+                                                &pending.binding_id,
+                                                &pending.hotkey_string,
+                                            );
+                                        }
+                                    }
+                                }
+
+                                // Hybrid double-tap window elapsed with no second
+                                // tap: it was a lone quick tap -> stop & insert
+                                // (a tiny clip, usually transcribes to nothing).
+                                if hybrid.pending_tap_deadline.is_some_and(|d| now >= d) {
+                                    hybrid.pending_tap_deadline = None;
+                                    hybrid.press_start = None;
+                                    if !hybrid.latched {
+                                        if let (Some(bid), Some(hk)) =
+                                            (hybrid.binding_id.clone(), hybrid.hotkey_string.clone())
+                                        {
+                                            if matches!(&stage, Stage::Recording(id) if id == &bid) {
+                                                stop(&app, &mut stage, &bid, &hk);
+                                            }
+                                        }
+                                        hybrid.binding_id = None;
+                                        hybrid.hotkey_string = None;
                                     }
                                 }
                                 continue;
@@ -123,8 +262,43 @@ impl TranscriptionCoordinator {
                             binding_id,
                             hotkey_string,
                             is_pressed,
-                            push_to_talk,
+                            mode,
                         } => {
+                            // Hybrid mode has its own state machine: hold to talk,
+                            // double-tap to latch hands-free, tap to stop.
+                            if matches!(mode, ActivationMode::Hybrid) {
+                                match evaluate_hybrid(
+                                    &mut hybrid,
+                                    &stage,
+                                    &binding_id,
+                                    is_pressed,
+                                    Instant::now(),
+                                    HOLD_THRESHOLD,
+                                    DOUBLE_TAP_WINDOW,
+                                ) {
+                                    HybridAction::Start => {
+                                        start(&app, &mut stage, &binding_id, &hotkey_string);
+                                        if matches!(&stage, Stage::Recording(id) if id == &binding_id)
+                                        {
+                                            hybrid.binding_id = Some(binding_id.clone());
+                                            hybrid.hotkey_string = Some(hotkey_string.clone());
+                                        } else {
+                                            hybrid.reset();
+                                        }
+                                    }
+                                    HybridAction::Stop => {
+                                        stop(&app, &mut stage, &binding_id, &hotkey_string);
+                                        hybrid.reset();
+                                    }
+                                    HybridAction::None => {}
+                                }
+                                continue;
+                            }
+
+                            // Non-hybrid: PushToTalk => hold; Toggle => press to
+                            // toggle. (`resolve()` never yields Global here.)
+                            let push_to_talk = matches!(mode, ActivationMode::PushToTalk);
+
                             let pending_release_binding = pending_release
                                 .as_ref()
                                 .map(|pending| pending.binding_id.as_str());
@@ -192,6 +366,7 @@ impl TranscriptionCoordinator {
                             recording_was_active,
                         } => {
                             pending_release = None;
+                            hybrid.reset();
                             // Don't reset during processing — wait for the pipeline to finish.
                             if !matches!(stage, Stage::Processing)
                                 && (recording_was_active || matches!(stage, Stage::Recording(_)))
@@ -215,13 +390,13 @@ impl TranscriptionCoordinator {
     }
 
     /// Send a keyboard/signal input event for a transcribe binding.
-    /// For signal-based toggles, use `is_pressed: true` and `push_to_talk: false`.
+    /// For signal-based toggles, use `is_pressed: true` and `mode: ActivationMode::Toggle`.
     pub fn send_input(
         &self,
         binding_id: &str,
         hotkey_string: &str,
         is_pressed: bool,
-        push_to_talk: bool,
+        mode: ActivationMode,
     ) {
         if self
             .tx
@@ -229,7 +404,7 @@ impl TranscriptionCoordinator {
                 binding_id: binding_id.to_string(),
                 hotkey_string: hotkey_string.to_string(),
                 is_pressed,
-                push_to_talk,
+                mode,
             })
             .is_err()
         {
@@ -517,5 +692,102 @@ mod tests {
             "a genuine release should stop recording exactly once"
         );
         assert_eq!(result.stage, SimStage::Processing);
+    }
+
+    // ---------------------------------------------------------------------
+    // Hybrid mode: hold-to-talk + double-tap-to-latch on one key.
+    // ---------------------------------------------------------------------
+
+    const HT: Duration = Duration::from_millis(300);
+    const DTW: Duration = Duration::from_millis(400);
+    const HB: &str = "transcribe";
+
+    #[test]
+    fn hybrid_hold_starts_then_stops_after_threshold() {
+        let mut h = HybridState::default();
+        let t0 = Instant::now();
+        assert_eq!(
+            evaluate_hybrid(&mut h, &Stage::Idle, HB, true, t0, HT, DTW),
+            HybridAction::Start
+        );
+        let rec = Stage::Recording(HB.to_string());
+        // Held well past the threshold: release stops (push-to-talk).
+        assert_eq!(
+            evaluate_hybrid(&mut h, &rec, HB, false, t0 + Duration::from_millis(500), HT, DTW),
+            HybridAction::Stop
+        );
+    }
+
+    #[test]
+    fn hybrid_double_tap_latches_then_tap_stops() {
+        let mut h = HybridState::default();
+        let t0 = Instant::now();
+        let rec = Stage::Recording(HB.to_string());
+
+        // First tap: press starts recording, quick release opens the window.
+        assert_eq!(
+            evaluate_hybrid(&mut h, &Stage::Idle, HB, true, t0, HT, DTW),
+            HybridAction::Start
+        );
+        assert_eq!(
+            evaluate_hybrid(&mut h, &rec, HB, false, t0 + Duration::from_millis(50), HT, DTW),
+            HybridAction::None
+        );
+        assert!(h.pending_tap_deadline.is_some());
+        assert!(!h.latched);
+
+        // Second press within the window latches hands-free.
+        assert_eq!(
+            evaluate_hybrid(&mut h, &rec, HB, true, t0 + Duration::from_millis(150), HT, DTW),
+            HybridAction::None
+        );
+        assert!(h.latched);
+        assert!(h.pending_tap_deadline.is_none());
+
+        // Release while latched is ignored.
+        assert_eq!(
+            evaluate_hybrid(&mut h, &rec, HB, false, t0 + Duration::from_millis(200), HT, DTW),
+            HybridAction::None
+        );
+
+        // A later single press stops the latched recording.
+        assert_eq!(
+            evaluate_hybrid(&mut h, &rec, HB, true, t0 + Duration::from_millis(3000), HT, DTW),
+            HybridAction::Stop
+        );
+    }
+
+    #[test]
+    fn hybrid_lone_quick_tap_opens_window_without_latching() {
+        let mut h = HybridState::default();
+        let t0 = Instant::now();
+        let rec = Stage::Recording(HB.to_string());
+        assert_eq!(
+            evaluate_hybrid(&mut h, &Stage::Idle, HB, true, t0, HT, DTW),
+            HybridAction::Start
+        );
+        assert_eq!(
+            evaluate_hybrid(&mut h, &rec, HB, false, t0 + Duration::from_millis(40), HT, DTW),
+            HybridAction::None
+        );
+        // Still recording, waiting for a possible second tap; not latched.
+        // (The coordinator loop stops it when the window expires.)
+        assert!(h.pending_tap_deadline.is_some());
+        assert!(!h.latched);
+    }
+
+    #[test]
+    fn hybrid_press_after_window_does_not_latch() {
+        let mut h = HybridState::default();
+        let t0 = Instant::now();
+        let rec = Stage::Recording(HB.to_string());
+        evaluate_hybrid(&mut h, &Stage::Idle, HB, true, t0, HT, DTW);
+        evaluate_hybrid(&mut h, &rec, HB, false, t0 + Duration::from_millis(40), HT, DTW);
+        let late = t0 + Duration::from_millis(40) + DTW + Duration::from_millis(10);
+        assert_eq!(
+            evaluate_hybrid(&mut h, &rec, HB, true, late, HT, DTW),
+            HybridAction::None
+        );
+        assert!(!h.latched);
     }
 }

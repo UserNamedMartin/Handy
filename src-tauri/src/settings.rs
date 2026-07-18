@@ -92,16 +92,25 @@ pub enum ActivationMode {
     Global,
     PushToTalk,
     Toggle,
+    /// Hold to talk, OR double-tap to lock hands-free recording (tap once more
+    /// to stop) — the "Wispr Flow"-style behaviour, all on a single key.
+    Hybrid,
 }
 
 impl ActivationMode {
-    /// Resolve the effective push-to-talk boolean for this mode, given the
-    /// app-wide default that `Global` bindings follow.
-    pub fn resolve(self, global_push_to_talk: bool) -> bool {
+    /// Resolve `Global` to the concrete mode implied by the app-wide
+    /// `push_to_talk` setting. Non-`Global` modes are returned unchanged, so the
+    /// result is never `Global`.
+    pub fn resolve(self, global_push_to_talk: bool) -> ActivationMode {
         match self {
-            ActivationMode::Global => global_push_to_talk,
-            ActivationMode::PushToTalk => true,
-            ActivationMode::Toggle => false,
+            ActivationMode::Global => {
+                if global_push_to_talk {
+                    ActivationMode::PushToTalk
+                } else {
+                    ActivationMode::Toggle
+                }
+            }
+            other => other,
         }
     }
 }
@@ -843,7 +852,9 @@ pub fn get_default_settings() -> AppSettings {
             description: "Converts your speech into text.".to_string(),
             default_binding: default_shortcut.to_string(),
             current_binding: default_shortcut.to_string(),
-            activation_mode: ActivationMode::Global,
+            // Hybrid by default: hold to talk, OR double-tap to lock hands-free
+            // (tap once more to stop) — the "Wispr Flow" one-key experience.
+            activation_mode: ActivationMode::Hybrid,
         },
     );
     // Second transcribe binding, fixed to Toggle mode: press once to start
