@@ -22,6 +22,9 @@ export const GeneralSettings: React.FC = () => {
       <SettingsGroup title={t("settings.general.title")}>
         <ShortcutInput shortcutId="transcribe" grouped={true} />
         <PushToTalk descriptionMode="tooltip" grouped={true} />
+        {/* Dedicated hands-free (toggle) transcribe key: always toggle mode,
+            works alongside the hold-to-talk Transcribe key above. */}
+        <ShortcutInput shortcutId="transcribe_toggle" grouped={true} />
         {/* Cancel shortcut is hidden with push-to-talk (release key cancels) and on Linux (dynamic shortcut instability) */}
         {!isLinux && !pushToTalk && (
           <ShortcutInput shortcutId="cancel" grouped={true} />

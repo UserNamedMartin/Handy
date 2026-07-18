@@ -77,6 +77,35 @@ impl From<LogLevel> for tauri_plugin_log::LogLevel {
     }
 }
 
+/// How an individual transcribe binding chooses between hold-to-talk and
+/// toggle behaviour, independent of the app-wide `push_to_talk` setting.
+///
+/// - `Global` follows the app-wide `push_to_talk` setting (backward-compatible
+///   default, so existing bindings keep behaving exactly as before).
+/// - `PushToTalk` always records while the key is held and stops on release.
+/// - `Toggle` starts recording on the first press and stops on the next press
+///   (hands-free — no need to keep holding the key).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Type, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivationMode {
+    #[default]
+    Global,
+    PushToTalk,
+    Toggle,
+}
+
+impl ActivationMode {
+    /// Resolve the effective push-to-talk boolean for this mode, given the
+    /// app-wide default that `Global` bindings follow.
+    pub fn resolve(self, global_push_to_talk: bool) -> bool {
+        match self {
+            ActivationMode::Global => global_push_to_talk,
+            ActivationMode::PushToTalk => true,
+            ActivationMode::Toggle => false,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Type)]
 pub struct ShortcutBinding {
     pub id: String,
@@ -84,6 +113,10 @@ pub struct ShortcutBinding {
     pub description: String,
     pub default_binding: String,
     pub current_binding: String,
+    /// Per-binding activation mode. Defaults to `Global` so stores written by
+    /// older versions (which lack this field) keep the previous behaviour.
+    #[serde(default)]
+    pub activation_mode: ActivationMode,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Type)]
@@ -794,6 +827,13 @@ pub fn get_default_settings() -> AppSettings {
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     let default_shortcut = "alt+space";
 
+    // Dedicated hands-free (toggle) transcribe shortcut. Uses a distinct combo
+    // so it never collides with the primary (hold-to-talk) transcribe binding.
+    #[cfg(target_os = "macos")]
+    let default_toggle_shortcut = "ctrl+option+space";
+    #[cfg(not(target_os = "macos"))]
+    let default_toggle_shortcut = "ctrl+alt+space";
+
     let mut bindings = HashMap::new();
     bindings.insert(
         "transcribe".to_string(),
@@ -803,6 +843,23 @@ pub fn get_default_settings() -> AppSettings {
             description: "Converts your speech into text.".to_string(),
             default_binding: default_shortcut.to_string(),
             current_binding: default_shortcut.to_string(),
+            activation_mode: ActivationMode::Global,
+        },
+    );
+    // Second transcribe binding, fixed to Toggle mode: press once to start
+    // recording hands-free, press again to stop and transcribe. Lets the user
+    // have a hold-to-talk key and a hands-free key active at the same time.
+    bindings.insert(
+        "transcribe_toggle".to_string(),
+        ShortcutBinding {
+            id: "transcribe_toggle".to_string(),
+            name: "Transcribe (Toggle)".to_string(),
+            description:
+                "Hands-free dictation: press once to start recording, press again to stop and insert."
+                    .to_string(),
+            default_binding: default_toggle_shortcut.to_string(),
+            current_binding: default_toggle_shortcut.to_string(),
+            activation_mode: ActivationMode::Toggle,
         },
     );
     #[cfg(target_os = "windows")]
@@ -823,6 +880,7 @@ pub fn get_default_settings() -> AppSettings {
                 .to_string(),
             default_binding: default_post_process_shortcut.to_string(),
             current_binding: default_post_process_shortcut.to_string(),
+            activation_mode: ActivationMode::Global,
         },
     );
     bindings.insert(
@@ -833,6 +891,7 @@ pub fn get_default_settings() -> AppSettings {
             description: "Cancels the current recording.".to_string(),
             default_binding: "escape".to_string(),
             current_binding: "escape".to_string(),
+            activation_mode: ActivationMode::Global,
         },
     );
 

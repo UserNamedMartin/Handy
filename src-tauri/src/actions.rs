@@ -910,6 +910,14 @@ pub static ACTION_MAP: Lazy<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy::ne
             post_process: false,
         }) as Arc<dyn ShortcutAction>,
     );
+    // Same plain-transcribe action as "transcribe"; distinct id so it can carry
+    // its own key binding and (Toggle) activation mode.
+    map.insert(
+        "transcribe_toggle".to_string(),
+        Arc::new(TranscribeAction {
+            post_process: false,
+        }) as Arc<dyn ShortcutAction>,
+    );
     map.insert(
         "transcribe_with_post_process".to_string(),
         Arc::new(TranscribeAction { post_process: true }) as Arc<dyn ShortcutAction>,

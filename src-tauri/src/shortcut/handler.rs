@@ -37,7 +37,16 @@ pub fn handle_shortcut_event(
     // Transcribe bindings are handled by the coordinator.
     if is_transcribe_binding(binding_id) {
         if let Some(coordinator) = app.try_state::<TranscriptionCoordinator>() {
-            coordinator.send_input(binding_id, hotkey_string, is_pressed, settings.push_to_talk);
+            // Resolve the effective push-to-talk behaviour for THIS binding. A
+            // binding can override the app-wide `push_to_talk` flag through its
+            // own `activation_mode` (e.g. a dedicated hands-free Toggle key that
+            // works alongside a hold-to-talk key).
+            let push_to_talk = settings
+                .bindings
+                .get(binding_id)
+                .map(|b| b.activation_mode.resolve(settings.push_to_talk))
+                .unwrap_or(settings.push_to_talk);
+            coordinator.send_input(binding_id, hotkey_string, is_pressed, push_to_talk);
         } else {
             warn!("TranscriptionCoordinator is not initialized");
         }
