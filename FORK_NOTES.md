@@ -127,8 +127,13 @@ but a locally-built app still launches — the first launch may need Right-click
 System Settings → Privacy & Security → "Open Anyway"). Then enable **Handy** under
 **Accessibility** and **Microphone**. Not needed again on later rebuilds.
 
-**If the signing keychain is ever lost**, re-import the *same* cert to keep the identity
-(and your grants) stable:
+**If codesigning breaks — recreate the keychain from the backup p12.** This is a
+recurring gotcha, not a one-off: because signing uses a *separate* keychain (not the
+login keychain), a session/login reset can drop `codesign`'s access to the private key.
+The tell-tale symptom is `codesign` failing with **`<SHA>: no identity found`** even
+though `security find-identity -p codesigning` still lists the cert. Re-importing the
+*same* cert from the p12 fixes it, and because it's the same cert the **SHA (and your
+TCC grants) stay the same** — no permission re-grant needed:
 ```bash
 security create-keychain -p handydev ~/Library/Keychains/handy-signing.keychain-db
 security unlock-keychain  -p handydev ~/Library/Keychains/handy-signing.keychain-db
