@@ -14,7 +14,7 @@ Bundle id: `com.pais.handy` (same as the official app → shares settings/models
 ## Custom features in this fork (not upstream)
 
 ### Per-binding activation mode + dedicated hands-free toggle key
-Branch: `feat/per-binding-activation-mode`
+All fork work lives directly on `main` (this is a personal fork — no feature-branch ceremony; commit straight to `main`).
 
 Upstream has a single global `push_to_talk` flag that forces **every** transcribe
 binding into hold-to-talk (`true`) or toggle (`false`). This fork lets **each binding
@@ -153,10 +153,14 @@ safe (regenerated on rebuild; keeps the compile cache) — but keep the rest of 
 
 ## Sync with upstream
 
+Your `main` has diverged from the original (that's expected for a personal fork).
+To pull the original's updates into it:
+
 ```bash
 git fetch upstream
-git checkout feat/per-binding-activation-mode
-git rebase upstream/main        # or: git merge upstream/main
-# likely conflict files: settings.rs, shortcut/handler.rs, GeneralSettings.tsx — see the
-# "Custom features" section above to re-apply intent, then rebuild.
+git checkout main
+git merge upstream/main          # or: git rebase upstream/main
+# likely conflict files: settings.rs, shortcut/handler.rs, GeneralSettings.tsx,
+# overlay.rs, RecordingOverlay.{css,tsx} — see the "Custom features" / "Other
+# local fixes" sections above to re-apply intent, then rebuild.
 ```
