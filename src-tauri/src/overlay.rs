@@ -499,6 +499,9 @@ fn show_overlay_state(app_handle: &AppHandle, state: &str) {
         force_overlay_topmost(&overlay_window);
 
         let _ = overlay_window.emit("show-overlay", state);
+        // Keep tracking Dock/fullscreen changes while the overlay stays up.
+        #[cfg(target_os = "macos")]
+        start_overlay_reposition_loop(app_handle);
         log::debug!(
             "overlay '{}': set_size={:?} pos_calc={:?} set_pos={:?} show={:?}",
             state,
@@ -549,8 +552,39 @@ pub fn update_overlay_position(app_handle: &AppHandle) {
     }
 }
 
+/// Live overlay repositioning: while the overlay is visible, re-run positioning
+/// on a short timer so it tracks Dock/fullscreen changes that happen mid-show
+/// (revealing the Dock in fullscreen, leaving fullscreen, toggling auto-hide).
+/// macOS only — other platforms anchor to fixed monitor bounds, nothing to track.
+#[cfg(target_os = "macos")]
+static OVERLAY_VISIBLE: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static OVERLAY_REPOSITION_GEN: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "macos")]
+fn start_overlay_reposition_loop(app_handle: &AppHandle) {
+    OVERLAY_VISIBLE.store(true, Ordering::Relaxed);
+    // Supersede any previous loop so only the latest show keeps polling.
+    let my_gen = OVERLAY_REPOSITION_GEN.fetch_add(1, Ordering::Relaxed) + 1;
+    let app = app_handle.clone();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        if !OVERLAY_VISIBLE.load(Ordering::Relaxed)
+            || OVERLAY_REPOSITION_GEN.load(Ordering::Relaxed) != my_gen
+        {
+            break;
+        }
+        let app_for_main = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            update_overlay_position(&app_for_main);
+        });
+    });
+}
+
 /// Hides the recording overlay window with fade-out animation
 pub fn hide_recording_overlay(app_handle: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    OVERLAY_VISIBLE.store(false, Ordering::Relaxed);
     // Always hide the overlay regardless of settings - if setting was changed while recording,
     // we still want to hide it properly
     if let Some(overlay_window) = app_handle.get_webview_window("recording_overlay") {
