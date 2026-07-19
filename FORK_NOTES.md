@@ -43,6 +43,7 @@ Files touched (keep them consistent if you extend this):
 between taps) are consts at the top of `transcription_coordinator.rs`.
 
 ### Other local fixes
+- **Fullscreen-aware overlay position** (`src-tauri/src/overlay.rs`): the bottom anchor used only macOS `work_area`, which a background app is handed as the *desktop's* Dock-reserved frame even when another app is in native fullscreen — so the pill floated up "as if the Dock were there." Added `ax_fullscreen::frontmost_is_fullscreen()` (Accessibility API via hand-declared `ApplicationServices` externs + `core-foundation`, the same signal Wispr Flow uses; Handy already holds Accessibility permission). When the focused window is fullscreen → anchor to the physical screen bottom; otherwise keep the Dock-aware `work_area` (above Dock when shown, near edge when auto-hidden). Position is computed once per overlay show, so it does not live-track the Dock revealing during a dictation. Added dep: `core-foundation` (macOS).
 - **Long-form punctuation** (`src-tauri/src/managers/transcription.rs`): whisper-family
   transcription now sets `condition_on_prev_tokens: false`. whisper.cpp's default
   conditions each 30 s window on the previous window's decoded text; on long dictations

@@ -230,6 +230,81 @@ fn is_mouse_within_monitor(
 /// We must use LogicalPosition (not PhysicalPosition) because Tauri/tao
 /// converts PhysicalPosition using the scale factor of the monitor the window
 /// is *currently* on, which is wrong when moving cross-monitor.
+/// Detect whether the frontmost app's focused window is in native fullscreen,
+/// via the Accessibility API (the signal Wispr Flow uses). Handy already holds
+/// Accessibility permission for global shortcuts, so this needs nothing extra.
+/// Used to anchor the overlay to the physical screen bottom when a fullscreen
+/// space hides the Dock — macOS hands a background app the desktop's
+/// Dock-reserved work_area in that case, so work_area alone can't be trusted.
+#[cfg(target_os = "macos")]
+mod ax_fullscreen {
+    use core_foundation::base::TCFType;
+    use core_foundation::string::CFString;
+    use std::os::raw::c_void;
+
+    type CFTypeRef = *const c_void;
+    type CFStringRef = *const c_void;
+
+    #[link(name = "ApplicationServices", kind = "framework")]
+    extern "C" {
+        fn AXIsProcessTrusted() -> u8;
+        fn AXUIElementCreateSystemWide() -> CFTypeRef;
+        fn AXUIElementCopyAttributeValue(
+            element: CFTypeRef,
+            attribute: CFStringRef,
+            value: *mut CFTypeRef,
+        ) -> i32;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFRelease(cf: CFTypeRef);
+        fn CFBooleanGetValue(boolean: CFTypeRef) -> u8;
+    }
+
+    unsafe fn copy_attr(element: CFTypeRef, name: &'static str) -> Option<CFTypeRef> {
+        if element.is_null() {
+            return None;
+        }
+        let attr = CFString::from_static_string(name);
+        let mut out: CFTypeRef = std::ptr::null();
+        let err =
+            AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef() as CFStringRef, &mut out);
+        if err == 0 && !out.is_null() {
+            Some(out)
+        } else {
+            None
+        }
+    }
+
+    /// True only if we can positively confirm the focused window is fullscreen.
+    /// Any uncertainty (no permission, query fails) returns false, so the caller
+    /// falls back to normal Dock-aware work-area positioning.
+    pub fn frontmost_is_fullscreen() -> bool {
+        unsafe {
+            if AXIsProcessTrusted() == 0 {
+                return false;
+            }
+            let system = AXUIElementCreateSystemWide();
+            if system.is_null() {
+                return false;
+            }
+            let mut result = false;
+            if let Some(app) = copy_attr(system, "AXFocusedApplication") {
+                if let Some(window) = copy_attr(app, "AXFocusedWindow") {
+                    if let Some(fs) = copy_attr(window, "AXFullScreen") {
+                        result = CFBooleanGetValue(fs) != 0;
+                        CFRelease(fs);
+                    }
+                    CFRelease(window);
+                }
+                CFRelease(app);
+            }
+            CFRelease(system);
+            result
+        }
+    }
+}
+
 fn calculate_overlay_position(
     app_handle: &AppHandle,
     width: f64,
@@ -251,8 +326,17 @@ fn calculate_overlay_position(
             // space, so no monitor offset is added.
             #[cfg(target_os = "macos")]
             let bottom = {
-                let wa = monitor.work_area();
-                (wa.position.y as f64 + wa.size.height as f64) / scale
+                if ax_fullscreen::frontmost_is_fullscreen() {
+                    // A fullscreen space hides the Dock, but macOS still reports
+                    // the desktop's Dock-reserved work_area to a background app.
+                    // Anchor to the physical screen bottom instead (Wispr-style).
+                    monitor_y + monitor.size().height as f64 / scale
+                } else {
+                    // Desktop: work_area already tracks the Dock — above it when
+                    // shown, near the screen edge when auto-hidden.
+                    let wa = monitor.work_area();
+                    (wa.position.y as f64 + wa.size.height as f64) / scale
+                }
             };
             #[cfg(not(target_os = "macos"))]
             let bottom = monitor_y + monitor.size().height as f64 / scale;
