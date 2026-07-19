@@ -257,7 +257,7 @@
 }
 /* Working row: the spinner is larger than the dot, so use its own gap. */
 .sbase-l:has(.sspinner) {
-  padding-left: calc((var(--ov-base-h) - 13px) / 2);
+  padding-left: calc((var(--ov-base-h) - 11px) / 2);
 }
 .sbase-r {
   display: flex;
@@ -362,8 +362,8 @@
 
 /* working state (transcribing / polishing) — spinner + label */
 .sspinner {
-  width: 13px;
-  height: 13px;
+  width: 11px;
+  height: 11px;
   border-radius: 50%;
   border: 2px solid var(--s-hair);
   border-top-color: var(--s-accent);

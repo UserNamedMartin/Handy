@@ -486,6 +486,9 @@ fn show_overlay_state(app_handle: &AppHandle, state: &str) {
             let set_pos_started = std::time::Instant::now();
             let _ = overlay_window
                 .set_position(tauri::Position::Logical(tauri::LogicalPosition { x, y }));
+            // Appear in place — don't glide in from a previous spot.
+            #[cfg(target_os = "macos")]
+            overlay_anim_snap_to(Some((x, y)));
             set_pos_elapsed = set_pos_started.elapsed();
         }
         let pos_calc_elapsed = pos_started.elapsed() - set_pos_elapsed;
@@ -548,43 +551,111 @@ pub fn update_overlay_position(app_handle: &AppHandle) {
         if let Some((x, y)) = calculate_overlay_position(app_handle, width, height) {
             let _ = overlay_window
                 .set_position(tauri::Position::Logical(tauri::LogicalPosition { x, y }));
+            // Keep the ease loop in sync when position is set directly.
+            #[cfg(target_os = "macos")]
+            overlay_anim_snap_to(Some((x, y)));
         }
     }
 }
 
-/// Live overlay repositioning: while the overlay is visible, re-run positioning
-/// on a short timer so it tracks Dock/fullscreen changes that happen mid-show
-/// (revealing the Dock in fullscreen, leaving fullscreen, toggling auto-hide).
-/// macOS only — other platforms anchor to fixed monitor bounds, nothing to track.
+/// Live overlay repositioning: while the overlay is visible, track Dock/fullscreen
+/// changes that happen mid-show (revealing the Dock in fullscreen, leaving
+/// fullscreen, toggling auto-hide) and glide the pill to its new spot instead of
+/// snapping. macOS only — other platforms anchor to fixed monitor bounds.
 #[cfg(target_os = "macos")]
 static OVERLAY_VISIBLE: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "macos")]
 static OVERLAY_REPOSITION_GEN: AtomicU64 = AtomicU64::new(0);
+/// Animated placement in logical points: `.0` = where the pill is right now,
+/// `.1` = where it should be. The tick eases `.0` toward `.1`.
+#[cfg(target_os = "macos")]
+static OVERLAY_ANIM: std::sync::Mutex<(Option<(f64, f64)>, Option<(f64, f64)>)> =
+    std::sync::Mutex::new((None, None));
+
+/// Snap the animated placement to an exact point (on show: appear in place, no
+/// slide) or clear it (on hide). Keeps the ease loop from gliding from a stale
+/// position.
+#[cfg(target_os = "macos")]
+fn overlay_anim_snap_to(pos: Option<(f64, f64)>) {
+    if let Ok(mut a) = OVERLAY_ANIM.lock() {
+        *a = (pos, pos);
+    }
+}
 
 #[cfg(target_os = "macos")]
 fn start_overlay_reposition_loop(app_handle: &AppHandle) {
     OVERLAY_VISIBLE.store(true, Ordering::Relaxed);
-    // Supersede any previous loop so only the latest show keeps polling.
+    // Supersede any previous loop so only the latest show keeps running.
     let my_gen = OVERLAY_REPOSITION_GEN.fetch_add(1, Ordering::Relaxed) + 1;
     let app = app_handle.clone();
-    std::thread::spawn(move || loop {
-        std::thread::sleep(std::time::Duration::from_millis(250));
-        if !OVERLAY_VISIBLE.load(Ordering::Relaxed)
-            || OVERLAY_REPOSITION_GEN.load(Ordering::Relaxed) != my_gen
-        {
-            break;
+    std::thread::spawn(move || {
+        let mut frame: u64 = 0;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(16)); // ~60 fps
+            if !OVERLAY_VISIBLE.load(Ordering::Relaxed)
+                || OVERLAY_REPOSITION_GEN.load(Ordering::Relaxed) != my_gen
+            {
+                break;
+            }
+            frame = frame.wrapping_add(1);
+            // The Dock check is comparatively costly, so refresh the target only
+            // ~8x/sec; ease toward it every frame for a smooth glide.
+            let recompute = frame % 8 == 0;
+            let app_for_main = app.clone();
+            let _ = app.run_on_main_thread(move || {
+                overlay_anim_tick(&app_for_main, recompute);
+            });
         }
-        let app_for_main = app.clone();
-        let _ = app.run_on_main_thread(move || {
-            update_overlay_position(&app_for_main);
-        });
     });
+}
+
+/// One animation frame (main thread): occasionally refresh the target position,
+/// then ease the window toward it and move it.
+#[cfg(target_os = "macos")]
+fn overlay_anim_tick(app_handle: &AppHandle, recompute: bool) {
+    let Some(overlay_window) = app_handle.get_webview_window("recording_overlay") else {
+        return;
+    };
+    let Ok(mut anim) = OVERLAY_ANIM.lock() else {
+        return;
+    };
+    if recompute {
+        let (width, height) = current_overlay_logical_size(&overlay_window)
+            .unwrap_or((OVERLAY_WIDTH, OVERLAY_HEIGHT));
+        if let Some(t) = calculate_overlay_position(app_handle, width, height) {
+            anim.1 = Some(t);
+        }
+    }
+    let Some(target) = anim.1 else {
+        return;
+    };
+    let cur = anim.0.unwrap_or(target);
+    // Exponential ease-out toward the target (~150–200 ms to settle at 60 fps).
+    let ease = 0.30;
+    let mut next = (
+        cur.0 + (target.0 - cur.0) * ease,
+        cur.1 + (target.1 - cur.1) * ease,
+    );
+    // Snap once within half a pixel so it doesn't crawl forever.
+    if (target.0 - next.0).abs() < 0.5 && (target.1 - next.1).abs() < 0.5 {
+        next = target;
+    }
+    if anim.0 != Some(next) {
+        let _ = overlay_window.set_position(tauri::Position::Logical(tauri::LogicalPosition {
+            x: next.0,
+            y: next.1,
+        }));
+        anim.0 = Some(next);
+    }
 }
 
 /// Hides the recording overlay window with fade-out animation
 pub fn hide_recording_overlay(app_handle: &AppHandle) {
     #[cfg(target_os = "macos")]
-    OVERLAY_VISIBLE.store(false, Ordering::Relaxed);
+    {
+        OVERLAY_VISIBLE.store(false, Ordering::Relaxed);
+        overlay_anim_snap_to(None);
+    }
     // Always hide the overlay regardless of settings - if setting was changed while recording,
     // we still want to hide it properly
     if let Some(overlay_window) = app_handle.get_webview_window("recording_overlay") {
