@@ -1226,11 +1226,24 @@ impl TranscriptionManager {
                         // whisper run extension to a non-whisper arch is rejected
                         // with INVALID_ARG, so skip it there and let the fuzzy
                         // post-correction handle custom words instead.
-                        let family = if settings.custom_words.is_empty() || !model_is_whisper {
+                        // For whisper-family models, transcribe each 30s window
+                        // "fresh" (condition_on_prev_tokens = false). whisper.cpp's
+                        // default conditions each window on the previous window's
+                        // decoded text; on long dictations that self-conditioning
+                        // collapses punctuation into an unbroken wall of text (and
+                        // can trigger repetition loops). Short clips are one window
+                        // so they were never affected.
+                        let family = if !model_is_whisper {
                             None
                         } else {
+                            let initial_prompt = if settings.custom_words.is_empty() {
+                                None
+                            } else {
+                                Some(settings.custom_words.join(", "))
+                            };
                             Some(RunExtension::Whisper(WhisperRunOptions {
-                                initial_prompt: Some(settings.custom_words.join(", ")),
+                                initial_prompt,
+                                condition_on_prev_tokens: Some(false),
                                 ..Default::default()
                             }))
                         };

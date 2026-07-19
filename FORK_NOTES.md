@@ -42,6 +42,14 @@ Files touched (keep them consistent if you extend this):
 `HOLD_THRESHOLD` (300 ms — hold vs tap) and `DOUBLE_TAP_WINDOW` (400 ms — max gap
 between taps) are consts at the top of `transcription_coordinator.rs`.
 
+### Other local fixes
+- **Long-form punctuation** (`src-tauri/src/managers/transcription.rs`): whisper-family
+  transcription now sets `condition_on_prev_tokens: false`. whisper.cpp's default
+  conditions each 30 s window on the previous window's decoded text; on long dictations
+  that self-conditioning collapses punctuation into an unbroken wall of text (and can
+  trigger repetition loops). Disabling it transcribes each window fresh. Short clips
+  (one window) were never affected.
+
 To expose a per-binding mode **dropdown** in the UI later: add a Tauri command mirroring `change_ptt_setting` (in `shortcut/mod.rs`), register it in `lib.rs` `collect_commands!`, then run a debug build to regenerate `src/bindings.ts`.
 
 ---
