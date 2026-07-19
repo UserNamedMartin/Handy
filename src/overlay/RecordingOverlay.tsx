@@ -182,16 +182,7 @@ const RecordingOverlay: React.FC = () => {
       className="sx"
       aria-label="cancel"
       onClick={() => commands.cancelOperation()}
-    >
-      <svg viewBox="0 0 16 16" aria-hidden="true">
-        <path
-          d="M4 4 L12 12 M12 4 L4 12"
-          stroke="currentColor"
-          strokeWidth="1.6"
-          strokeLinecap="round"
-        />
-      </svg>
-    </button>
+    />
   );
 
   // dot (left) | waveform (center) | timer + cancel (right) — same structure for
