@@ -1,0 +1,359 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Handy Overlay Tuner</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; overflow: hidden; }
+  :root {
+    --chrome-ink: #ecebf0; --chrome-ink-2: #b6b2c2; --chrome-ink-3: #837e92;
+    --chrome-panel: rgba(28,27,33,.92); --chrome-line: #3a3743; --chrome-accent: #f28cbb;
+    --mono: ui-monospace,"SF Mono",Menlo,monospace;
+    --sys: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  body { font-family: var(--sys); color: var(--chrome-ink); }
+
+  .screen { position: fixed; inset: 0; overflow: hidden; transition: background .25s; }
+  .screen[data-desk="dark"]  { background: linear-gradient(160deg,#3a3942,#232228 60%,#171619); color:#cfcdd6; }
+  .screen[data-desk="light"] { background: linear-gradient(160deg,#eef0f4,#dde1e9 60%,#cdd3de); color:#3a3a44; }
+  .menubar { position:absolute; top:0; left:0; right:0; height:24px;
+    background: color-mix(in srgb, currentColor 8%, transparent);
+    border-bottom: 1px solid color-mix(in srgb, currentColor 10%, transparent);
+    display:flex; align-items:center; padding:0 12px; font-size:11px;
+    color: color-mix(in srgb, currentColor 60%, transparent); gap:16px; }
+
+  .pillpos {
+    position: fixed; left: 50%; bottom: var(--ov-bottom, 15px);
+    transform: translateX(-50%) scale(var(--zoom, 1)); transform-origin: bottom center;
+  }
+  .screen[data-pos="top"] .pillpos { bottom: auto; top: var(--ov-top, 46px); transform-origin: top center; }
+
+  .screen {
+    --t-accent-l:#faa2ca; --t-accent-d:#f28cbb; --t-accent:#f28cbb;
+    --t-rest-w:172px; --t-work-w:216px; --t-height:40px; --t-radius:24px; --t-border:22%;
+    --t-bar-w:4px; --t-bar-gap:3px; --t-bar-max:18px; --t-dot:7px; --t-label:12px; --t-x:22px; --t-spin:calc(var(--t-x) * 0.82);
+    --t-pop:460ms; --t-pulse:1900ms; --t-midgray:#808080;
+  }
+  .screen[data-desk="light"] { --t-surface:#fbfbfb; --t-text:#0f0f0f; --t-accent:var(--t-accent-l); }
+  .screen[data-desk="dark"]  { --t-surface:#2c2b29; --t-text:#fbfbfb; --t-accent:var(--t-accent-d); }
+
+  .scard {
+    width: var(--t-rest-w); border-radius: var(--t-radius); overflow: hidden;
+    background: color-mix(in srgb, var(--t-surface) 98%, transparent);
+    border: 1px solid color-mix(in srgb, var(--t-midgray) var(--t-border), transparent);
+    display:flex; flex-direction:column; font-family: var(--sys);
+    transition: width var(--t-pop) cubic-bezier(.22,1,.36,1),
+                border-radius var(--t-pop) cubic-bezier(.22,1,.36,1);
+  }
+  .scard.is-working { width: var(--t-work-w); }
+  .scard.pop { animation: scard-pop var(--t-pop) cubic-bezier(.22,1,.36,1); }
+  @keyframes scard-pop { from{opacity:0; transform:scale(.92);} to{opacity:1; transform:none;} }
+  .row { display:none; height:var(--t-height); padding:0; align-items:center;
+    grid-template-columns: minmax(14px,1fr) auto minmax(14px,1fr); }
+  .row.on { display:grid; }
+  /* Inset the dot / close button from their edge by the SAME amount as their
+     vertical centering gap ((height - size)/2), so each sits equidistant from
+     the top, bottom, and near side of the pill. */
+  .sbase-l{ display:flex; align-items:center; justify-self:start; }
+  /* Recording row: inset the dot by its own centering gap. Working row: the
+     spinner is X-sized, so inset it by the X's gap — keeps both symmetric. */
+  #rowRec .sbase-l{ padding-left:calc((var(--t-height) - var(--t-dot)) / 2); }
+  #rowWork .sbase-l{ padding-left:calc((var(--t-height) - var(--t-spin)) / 2); }
+  .sbase-r{ display:flex; align-items:center; gap:8px; justify-self:end;
+    padding-right:calc((var(--t-height) - var(--t-x)) / 2); }
+  .sdot{ width:var(--t-dot); height:var(--t-dot); border-radius:50%; background:var(--t-accent); flex:none; }
+  .sdot.pulse{ animation: sdot-pulse var(--t-pulse) infinite; }
+  @keyframes sdot-pulse{ 0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--t-accent) 40%,transparent);}
+    70%{box-shadow:0 0 0 7px transparent;} 100%{box-shadow:0 0 0 0 transparent;} }
+  .swave{ display:flex; align-items:center; gap:var(--t-bar-gap); padding:0 8px 0 6px; height:var(--t-bar-max); flex:none; }
+  .swave i{ width:var(--t-bar-w); border-radius:2px; background:var(--t-accent); height:2px;
+    transition: height 55ms linear; will-change:height; }
+  .sx{ width:var(--t-x); height:var(--t-x); border-radius:50%; flex:none; border:0; padding:0; display:flex;
+    align-items:center; justify-content:center; color:#8a8a8a;
+    background: color-mix(in srgb, var(--t-midgray) 12%, transparent); cursor:pointer;
+    transition: background-color .15s ease, color .15s ease; }
+  .sx svg{ width:calc(var(--t-x) * .41); height:calc(var(--t-x) * .41); }
+  .sx:hover{ color:var(--t-text); background: color-mix(in srgb, var(--t-accent) 28%, transparent); }
+  .swork-label{ font-size:var(--t-label); color:#8a8a8a; white-space:nowrap; padding:0 6px; }
+  .sspinner{ width:var(--t-spin); height:var(--t-spin); border-radius:50%;
+    border:2px solid color-mix(in srgb, var(--t-midgray) 12%, transparent);
+    border-top-color:var(--t-accent); animation:sspin .7s linear infinite; flex:none; }
+  @keyframes sspin{ to{transform:rotate(1turn);} }
+
+  .hud { position: fixed; top: 34px; left: 16px; display:flex; flex-direction:column; gap:10px; z-index:10; max-width: 300px; }
+  .hud .card { background: var(--chrome-panel); border:1px solid var(--chrome-line); border-radius:12px;
+    padding:12px 14px; backdrop-filter: blur(8px); box-shadow: 0 8px 30px rgba(0,0,0,.35); }
+  .micbtn { font:inherit; font-size:13px; font-weight:600; width:100%; padding:9px 12px; border:0; border-radius:9px;
+    background: var(--chrome-accent); color:#1a1016; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:8px; }
+  .micbtn.live { background:#2fbf71; color:#08160e; }
+  .micnote{ font-size:11.5px; color:var(--chrome-ink-3); margin:8px 0 0; line-height:1.45; }
+  .seg{ display:inline-flex; background:rgba(0,0,0,.25); border:1px solid var(--chrome-line); border-radius:9px; padding:3px; gap:2px; margin-top:2px; }
+  .seg button{ font:inherit; font-size:12px; color:var(--chrome-ink-2); background:none; border:0; padding:5px 10px; border-radius:6px; cursor:pointer; }
+  .seg button[aria-pressed="true"]{ background:var(--chrome-accent); color:#1a1016; font-weight:600; }
+  .seg .lbl{ font-size:10px; text-transform:uppercase; letter-spacing:.08em; color:var(--chrome-ink-3); align-self:center; padding:0 4px; }
+  .hudrow{ display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+
+  .panel { position: fixed; top: 34px; right: 16px; width: 300px; max-height: calc(100vh - 50px);
+    overflow-y: auto; background: var(--chrome-panel); border:1px solid var(--chrome-line);
+    border-radius:14px; backdrop-filter: blur(8px); box-shadow:0 8px 30px rgba(0,0,0,.35); z-index:10; scrollbar-width: thin; }
+  .panel.collapsed { display:none; }
+  .panel-toggle { position: fixed; top: 34px; right: 16px; z-index: 11; font:inherit; font-size:12.5px;
+    background: var(--chrome-panel); color:var(--chrome-ink); border:1px solid var(--chrome-line);
+    border-radius:9px; padding:8px 12px; cursor:pointer; backdrop-filter: blur(8px); display:none; }
+  .panel-toggle.show{ display:block; }
+  .panelhead{ display:flex; align-items:center; justify-content:space-between; padding:12px 16px; border-bottom:1px solid var(--chrome-line); position:sticky; top:0; background:var(--chrome-panel); }
+  .panelhead h2{ margin:0; font-size:13px; }
+  .panelhead button{ font:inherit; background:none; border:0; color:var(--chrome-ink-2); cursor:pointer; font-size:16px; padding:2px 4px; }
+  .grp{ padding:12px 16px; border-bottom:1px solid rgba(255,255,255,.05); }
+  .grp h3{ margin:0 0 10px; font-size:10.5px; text-transform:uppercase; letter-spacing:.1em; color:var(--chrome-ink-3); }
+  .ctl{ display:grid; grid-template-columns:88px 1fr 42px; align-items:center; gap:9px; margin:8px 0; }
+  .ctl label{ font-size:12px; color:var(--chrome-ink-2); }
+  .ctl .val{ font-family:var(--mono); font-size:11px; color:var(--chrome-accent); text-align:right; font-variant-numeric:tabular-nums; }
+  input[type=range]{ -webkit-appearance:none; appearance:none; width:100%; height:4px; border-radius:3px; background:var(--chrome-line); }
+  input[type=range]::-webkit-slider-thumb{ -webkit-appearance:none; width:14px; height:14px; border-radius:50%; background:var(--chrome-accent); cursor:pointer; }
+  input[type=color]{ width:100%; height:24px; padding:0; border:1px solid var(--chrome-line); border-radius:6px; background:none; cursor:pointer; grid-column:2/4; }
+  .ctl.color{ grid-template-columns:88px 1fr; }
+  .switch{ grid-column:2/4; justify-self:start; }
+  .switch input{ position:absolute; opacity:0; }
+  .switch label{ position:relative; display:inline-flex; align-items:center; gap:8px; cursor:pointer; font-size:12px; color:var(--chrome-ink-2); }
+  .switch .track{ width:32px; height:18px; border-radius:10px; background:var(--chrome-line); position:relative; transition:background .15s; }
+  .switch .track::after{ content:""; position:absolute; top:2px; left:2px; width:14px; height:14px; border-radius:50%; background:var(--chrome-ink-2); transition:transform .15s; }
+  .switch input:checked + .track{ background:var(--chrome-accent); }
+  .switch input:checked + .track::after{ transform:translateX(14px); background:#1a1016; }
+  .presets{ display:flex; flex-wrap:wrap; gap:6px; }
+  .presets button{ font:inherit; font-size:11.5px; color:var(--chrome-ink-2); background:rgba(255,255,255,.05); border:1px solid var(--chrome-line); border-radius:7px; padding:5px 9px; cursor:pointer; }
+  .presets button:hover{ color:var(--chrome-ink); border-color:var(--chrome-accent); }
+  .readout pre{ margin:0; background:rgba(0,0,0,.35); border:1px solid var(--chrome-line); border-radius:8px; padding:10px; font-family:var(--mono); font-size:10.5px; line-height:1.5; color:var(--chrome-ink-2); overflow-x:auto; white-space:pre; }
+  .readout .k{ color:var(--chrome-ink-3); } .readout .v{ color:var(--chrome-accent); }
+  .copybtn{ margin-top:8px; font:inherit; font-size:12px; width:100%; padding:8px; background:var(--chrome-accent); color:#1a1016; border:0; border-radius:7px; cursor:pointer; font-weight:600; }
+  @media (prefers-reduced-motion: reduce){ .sspinner,.scard.pop{ animation:none; } }
+</style>
+</head>
+<body>
+<div class="screen" id="screen" data-desk="dark" data-pos="bottom">
+  <div class="menubar"><span>●●●</span><span>Handy overlay — live preview</span></div>
+
+  <div class="hud">
+    <div class="card">
+      <button class="micbtn" id="mic">🎤 Starting mic…</button>
+      <div class="hudrow" style="margin-top:10px">
+        <div class="seg" role="group" aria-label="State">
+          <span class="lbl">State</span>
+          <button data-state="recording" aria-pressed="true">Rec</button>
+          <button data-state="working" aria-pressed="false">Transcribe</button>
+        </div>
+      </div>
+      <div class="hudrow" style="margin-top:8px">
+        <div class="seg" role="group" aria-label="Desktop">
+          <span class="lbl">Bg</span>
+          <button data-desk="dark" aria-pressed="true">Dark</button>
+          <button data-desk="light" aria-pressed="false">Light</button>
+        </div>
+        <div class="seg" role="group" aria-label="Placement">
+          <span class="lbl">Pos</span>
+          <button data-pos="bottom" aria-pressed="true">Bottom</button>
+          <button data-pos="top" aria-pressed="false">Top</button>
+        </div>
+      </div>
+      <p class="micnote" id="micnote">Mic auto-starts so the waveform tracks your voice.</p>
+    </div>
+  </div>
+
+  <button class="panel-toggle" id="panelToggle">⚙ Controls</button>
+  <aside class="panel" id="panel">
+    <div class="panelhead"><h2>Overlay tuner</h2><button id="collapse" aria-label="Hide">–</button></div>
+    <div class="grp"><h3>Presets</h3><div class="presets" id="presets">
+      <button data-preset="current">Current</button>
+      <button data-preset="small">Small</button>
+      <button data-preset="tiny">Tiny</button>
+      <button data-preset="micro">Micro</button>
+    </div></div>
+    <div class="grp"><h3>Size &amp; shape</h3>
+      <div class="ctl"><label>Rest width</label><input type="range" id="rest" min="60" max="320" step="2" value="172"><span class="val" id="rest_v">172</span></div>
+      <div class="ctl"><label>Working w.</label><input type="range" id="work" min="90" max="360" step="2" value="216"><span class="val" id="work_v">216</span></div>
+      <div class="ctl"><label>Height</label><input type="range" id="height" min="16" max="64" step="1" value="40"><span class="val" id="height_v">40</span></div>
+      <div class="ctl"><label>Corner</label><input type="range" id="radius" min="0" max="32" step="1" value="24"><span class="val" id="radius_v">24</span></div>
+      <div class="ctl"><label>Border</label><input type="range" id="border" min="0" max="60" step="1" value="22"><span class="val" id="border_v">22</span></div>
+    </div>
+    <div class="grp"><h3>Color</h3>
+      <div class="ctl color"><label>Accent light</label><input type="color" id="accentL" value="#faa2ca"></div>
+      <div class="ctl color"><label>Accent dark</label><input type="color" id="accentD" value="#f28cbb"></div>
+    </div>
+    <div class="grp"><h3>Waveform</h3>
+      <div class="ctl"><label>Bars</label><input type="range" id="bars" min="3" max="16" step="1" value="9"><span class="val" id="bars_v">9</span></div>
+      <div class="ctl"><label>Bar width</label><input type="range" id="barw" min="2" max="8" step="1" value="4"><span class="val" id="barw_v">4</span></div>
+      <div class="ctl"><label>Bar gap</label><input type="range" id="gap" min="1" max="8" step="1" value="3"><span class="val" id="gap_v">3</span></div>
+      <div class="ctl"><label>Max height</label><input type="range" id="barmax" min="6" max="30" step="1" value="18"><span class="val" id="barmax_v">18</span></div>
+      <div class="ctl"><label>Sensitivity</label><input type="range" id="sens" min="10" max="80" step="1" value="30"><span class="val" id="sens_v">3.0</span></div>
+    </div>
+    <div class="grp"><h3>Dot, close &amp; text</h3>
+      <div class="ctl"><label>Dot size</label><input type="range" id="dot" min="3" max="14" step="1" value="7"><span class="val" id="dot_v">7</span></div>
+      <div class="ctl"><label>Close btn</label><input type="range" id="x" min="12" max="28" step="1" value="22"><span class="val" id="x_v">22</span></div>
+      <div class="ctl"><label>Label size</label><input type="range" id="label" min="8" max="18" step="1" value="12"><span class="val" id="label_v">12</span></div>
+      <div class="ctl"><div class="switch"><input type="checkbox" id="pulse" checked><label for="pulse"><span class="track"></span> Pulse the dot</label></div></div>
+    </div>
+    <div class="grp"><h3>Motion</h3>
+      <div class="ctl"><label>Pop speed</label><input type="range" id="pop" min="120" max="700" step="10" value="460"><span class="val" id="pop_v">460</span></div>
+      <div class="ctl"><label>Pulse ms</label><input type="range" id="pulsems" min="800" max="3200" step="50" value="1900"><span class="val" id="pulsems_v">1900</span></div>
+    </div>
+    <div class="grp"><h3>Config → paste back to me</h3>
+      <div class="readout"><pre id="readout"></pre></div>
+      <button class="copybtn" id="copy">Copy config</button>
+    </div>
+  </aside>
+
+  <div class="pillpos" id="pillpos">
+    <div class="scard" id="card">
+      <div class="row on" id="rowRec">
+        <div class="sbase-l"><span class="sdot pulse" id="dot"></span></div>
+        <div class="swave" id="wave"></div>
+        <div class="sbase-r"><button class="sx" aria-label="cancel"><svg viewBox="0 0 16 16"><path d="M4 4 L12 12 M12 4 L4 12" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button></div>
+      </div>
+      <div class="row" id="rowWork">
+        <div class="sbase-l"><span class="sspinner"></span></div>
+        <span class="swork-label">Transcribing…</span>
+        <div class="sbase-r"><button class="sx" aria-label="cancel"><svg viewBox="0 0 16 16"><path d="M4 4 L12 12 M12 4 L4 12" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+  var $ = function(id){ return document.getElementById(id); };
+  var screen = $("screen"), card = $("card"), wave = $("wave"), dot = $("dot"),
+      pillpos = $("pillpos"), readout = $("readout");
+  var state = "recording";
+  // sens stored ×10 in the slider (10..80 -> 1.0..8.0)
+  var knobs = { rest:172, work:216, height:40, radius:24, border:22, accentL:"#faa2ca", accentD:"#f28cbb",
+    bars:9, barw:4, gap:3, barmax:18, sens:30, dot:7, x:22, label:12, pop:460, pulsems:1900, pulse:true };
+
+  var presets = {
+    current:{rest:172,work:216,height:40,radius:24,border:22,bars:9,barw:4,gap:3,barmax:18,sens:30,dot:7,x:22,label:12,pop:460,pulsems:1900,pulse:true},
+    small:  {rest:130,work:170,height:30,radius:18,border:22,bars:7,barw:3,gap:3,barmax:14,sens:38,dot:6,x:18,label:11,pop:400,pulsems:1900,pulse:true},
+    tiny:   {rest:92,work:132,height:24,radius:14,border:24,bars:7,barw:3,gap:2,barmax:11,sens:45,dot:5,x:16,label:10,pop:360,pulsems:1800,pulse:true},
+    micro:  {rest:80, work:118,height:20,radius:12,border:26,bars:4,barw:2,gap:2,barmax:9, sens:50,dot:4,x:14,label:9, pop:320,pulsems:1700,pulse:true}
+  };
+
+  function sv(k,v){ screen.style.setProperty(k,v); }
+  function buildWave(){ wave.innerHTML=""; for(var i=0;i<knobs.bars;i++) wave.appendChild(document.createElement("i")); }
+
+  function apply(){
+    sv("--t-rest-w",knobs.rest+"px"); sv("--t-work-w",knobs.work+"px"); sv("--t-height",knobs.height+"px");
+    sv("--t-radius",knobs.radius+"px"); sv("--t-border",knobs.border+"%");
+    sv("--t-accent-l",knobs.accentL); sv("--t-accent-d",knobs.accentD);
+    sv("--t-bar-w",knobs.barw+"px"); sv("--t-bar-gap",knobs.gap+"px"); sv("--t-bar-max",knobs.barmax+"px");
+    sv("--t-dot",knobs.dot+"px"); sv("--t-x",knobs.x+"px"); sv("--t-label",knobs.label+"px");
+    sv("--t-pop",knobs.pop+"ms"); sv("--t-pulse",knobs.pulsems+"ms");
+    dot.classList.toggle("pulse",knobs.pulse);
+    if(wave.children.length!==knobs.bars) buildWave();
+    for(var id in knobs){ var el=$(id); if(!el) continue;
+      if(el.type==="checkbox") el.checked=knobs[id]; else if(el.type!=="color") el.value=knobs[id];
+      var vv=$(id+"_v"); if(vv) vv.textContent = (id==="sens") ? (knobs.sens/10).toFixed(1) : knobs[id]; }
+    $("accentL").value=knobs.accentL; $("accentD").value=knobs.accentD;
+    renderReadout();
+    try{ localStorage.setItem("handyTuner", JSON.stringify(knobs)); }catch(e){}
+  }
+  function renderReadout(){
+    var L=[["--ov-rest-w",knobs.rest+"px"],["--ov-work-w",knobs.work+"px"],["--ov-base-h",knobs.height+"px"],
+      ["border-radius",knobs.radius+"px"],["border alpha",knobs.border+"%"],["accent light",knobs.accentL],
+      ["accent dark",knobs.accentD],["wave bars",""+knobs.bars],["bar w/gap/max",knobs.barw+"/"+knobs.gap+"/"+knobs.barmax+"px"],
+      ["sensitivity",(knobs.sens/10).toFixed(1)+"x, centered"],["dot size",knobs.dot+"px"],["close btn",knobs.x+"px"],
+      ["label size",knobs.label+"px"],["pop/pulse",knobs.pop+"/"+knobs.pulsems+"ms"],["dot pulse",knobs.pulse?"on":"off"]];
+    readout.innerHTML=L.map(function(p){ return '<span class="k">'+(p[0]+"").padEnd(15)+'</span><span class="v">'+p[1]+'</span>'; }).join("\n");
+  }
+  function setState(s){ state=s;
+    $("rowRec").classList.toggle("on",s==="recording"); $("rowWork").classList.toggle("on",s==="working");
+    card.classList.toggle("is-working",s==="working");
+    card.classList.remove("pop"); void card.offsetWidth; card.classList.add("pop");
+    document.querySelectorAll('[data-state]').forEach(function(b){ b.setAttribute("aria-pressed",String(b.dataset.state===s)); });
+  }
+
+  document.querySelectorAll('[data-state]').forEach(function(b){ b.onclick=function(){ setState(b.dataset.state); }; });
+  document.querySelectorAll('[data-desk]').forEach(function(b){ b.onclick=function(){ screen.setAttribute("data-desk",b.dataset.desk);
+    document.querySelectorAll('[data-desk]').forEach(function(x){ x.setAttribute("aria-pressed",String(x.dataset.desk===b.dataset.desk)); }); }; });
+  document.querySelectorAll('[data-pos]').forEach(function(b){ b.onclick=function(){ screen.setAttribute("data-pos",b.dataset.pos);
+    document.querySelectorAll('[data-pos]').forEach(function(x){ x.setAttribute("aria-pressed",String(x.dataset.pos===b.dataset.pos)); }); }; });
+
+  ["rest","work","height","radius","border","bars","barw","gap","barmax","sens","dot","x","label","pop","pulsems"].forEach(function(id){
+    $(id).addEventListener("input",function(e){ knobs[id]=parseInt(e.target.value,10);
+      var vv=$(id+"_v"); if(vv) vv.textContent = (id==="sens") ? (knobs.sens/10).toFixed(1) : e.target.value; apply(); });
+  });
+  $("accentL").addEventListener("input",function(e){ knobs.accentL=e.target.value; apply(); });
+  $("accentD").addEventListener("input",function(e){ knobs.accentD=e.target.value; apply(); });
+  $("pulse").addEventListener("change",function(e){ knobs.pulse=e.target.checked; apply(); });
+  document.querySelectorAll("#presets button").forEach(function(b){ b.onclick=function(){ var p=presets[b.dataset.preset]; if(!p) return;
+    for(var k in p) knobs[k]=p[k]; apply(); setState(state); }; });
+  $("copy").onclick=function(){ var t="Handy overlay config\n"+readout.textContent; var me=this;
+    navigator.clipboard.writeText(t).then(function(){ var o=me.textContent; me.textContent="Copied ✓"; setTimeout(function(){me.textContent=o;},1300); }); };
+  $("collapse").onclick=function(){ $("panel").classList.add("collapsed"); $("panelToggle").classList.add("show"); };
+  $("panelToggle").onclick=function(){ $("panel").classList.remove("collapsed"); $("panelToggle").classList.remove("show"); };
+
+  // ---- microphone (auto-start) ----
+  var analyser=null, freq=null, levels=[], usingMic=false, audioCtx=null;
+  function enableMic(fromClick){
+    if (usingMic) return;
+    navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}}).then(function(stream){
+      audioCtx=new (window.AudioContext||window.webkitAudioContext)();
+      var src=audioCtx.createMediaStreamSource(stream);
+      analyser=audioCtx.createAnalyser(); analyser.fftSize=128; analyser.smoothingTimeConstant=0.5;
+      freq=new Uint8Array(analyser.frequencyBinCount); src.connect(analyser);
+      usingMic=true;
+      var b=$("mic"); b.classList.add("live"); b.textContent="🎤 Mic live — speak";
+      $("micnote").textContent="Live: bars pulse from the centre with your voice. Tune “Sensitivity” for how strongly.";
+      if (audioCtx.state==="suspended") audioCtx.resume();
+    }).catch(function(err){
+      var b=$("mic"); b.classList.remove("live"); b.textContent="🎤 Enable microphone";
+      $("micnote").textContent = fromClick
+        ? ("Mic blocked ("+(err&&err.name||"error")+"). Allow it for localhost in the address bar, then reload.")
+        : "Click to allow the microphone (needs one permission grant on localhost).";
+    });
+  }
+  $("mic").onclick=function(){ enableMic(true); };
+  // Resume the audio context on the first interaction if the browser suspended it.
+  ["click","keydown","pointerdown"].forEach(function(ev){
+    window.addEventListener(ev, function once(){ if(audioCtx && audioCtx.state==="suspended") audioCtx.resume();
+      window.removeEventListener(ev, once); });
+  });
+
+  // ---- waveform: symmetric, centre-weighted, gain-boosted ----
+  function frame(){
+    var bars=wave.children, n=bars.length;
+    var center=(n-1)/2;
+    var gain=knobs.sens/10;
+    var loud=0;
+    if(usingMic && analyser){
+      analyser.getByteFrequencyData(freq);
+      // average the voice band (low/mid buckets) for overall loudness
+      var sum=0,cnt=0, top=Math.min(freq.length,18);
+      for(var b=2;b<top;b++){ sum+=freq[b]; cnt++; }
+      loud=Math.min(1,(sum/(cnt||1))/255*gain);
+    }
+    for(var i=0;i<n;i++){
+      var dist = center>0 ? Math.abs(i-center)/center : 0;   // 0 centre .. 1 edge
+      var env = 0.30 + 0.70*Math.cos(dist*Math.PI/2);         // tall centre, short edges
+      var target;
+      if(usingMic && analyser){
+        target = loud*env*(0.82+0.36*Math.random());
+      } else {
+        target = state==="recording" ? (0.01+0.04*Math.random())*env : 0.0;
+      }
+      if(levels[i]===undefined) levels[i]=0.04;
+      levels[i]=levels[i]*0.55+target*0.45;                   // snappier response
+      var h=Math.max(2, Math.min(knobs.barmax, 2+levels[i]*(knobs.barmax-2)));
+      if(bars[i]) bars[i].style.height=h.toFixed(1)+"px";
+    }
+    requestAnimationFrame(frame);
+  }
+
+  // Restore the last tuning across page refreshes.
+  try{ var saved=JSON.parse(localStorage.getItem("handyTuner")||"null"); if(saved&&typeof saved==="object") Object.assign(knobs,saved); }catch(e){}
+  buildWave(); apply(); setState("recording"); requestAnimationFrame(frame);
+  // auto-start the mic (works once permission is granted for localhost)
+  enableMic(false);
+})();
+</script>
+</body>
+</html>
