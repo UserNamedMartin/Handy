@@ -262,7 +262,7 @@
 .sbase-r {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   justify-self: end;
   /* Mirror the dot: inset the cancel button by its own centring gap. */
   padding-right: calc((var(--ov-base-h) - 16px) / 2);
@@ -300,7 +300,8 @@
   display: flex;
   align-items: center;
   gap: 2px;
-  padding-right: 8px;
+  /* Match the tuner exactly: 6px before the bars, 8px after (toward the X). */
+  padding: 0 8px 0 6px;
   height: 11px;
   flex: none;
 }
