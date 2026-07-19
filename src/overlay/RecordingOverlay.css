@@ -336,7 +336,8 @@
 .sx svg {
   width: 7px;
   height: 7px;
-  display: block;
+  /* Robust flex centring (matches the tuner, which has no display:block). */
+  margin: auto;
 }
 .sx:hover {
   background: var(--s-accent-soft);
