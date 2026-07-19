@@ -14,9 +14,14 @@ import { getLanguageDirection } from "@/lib/utils/rtl";
 
 type OverlayState = "recording" | "streaming" | "transcribing" | "processing";
 
-// Number of reactive bars in the waveform (the simple, smoothed style shared by
-// every overlay form). Mic levels arrive as 16 FFT buckets; we take the first N.
-const WAVE_BARS = 9;
+// Number of reactive bars in the waveform. Mic levels arrive as 16 FFT buckets.
+const WAVE_BARS = 7;
+// Waveform response: overall loudness × gain, shaped by a symmetric centre
+// envelope so the bars pulse from the middle (not louder on the left). Tuned to
+// the "Tiny" look.
+const MIC_GAIN = 4.5;
+const BAR_MIN = 2;
+const BAR_MAX = 11;
 
 const RecordingOverlay: React.FC = () => {
   const { t } = useTranslation();
@@ -150,16 +155,25 @@ const RecordingOverlay: React.FC = () => {
     `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 
   // ---- Shared building blocks (one visual language for every overlay form) ----
+  // Overall voice loudness drives a symmetric, centre-tall envelope so the bars
+  // pulse from the middle. Gain makes normal speech clearly visible.
+  const center = (WAVE_BARS - 1) / 2;
+  const loud = Math.min(
+    1,
+    (levels.reduce((a, b) => a + b, 0) / (levels.length || 1)) * MIC_GAIN,
+  );
   const waveform = (
     <div className="swave">
-      {levels.map((v, i) => (
-        <i
-          key={i}
-          style={{
-            height: `${Math.max(3, Math.min(18, 3 + Math.pow(v, 0.7) * 15))}px`,
-          }}
-        />
-      ))}
+      {Array.from({ length: WAVE_BARS }).map((_, i) => {
+        const dist = center > 0 ? Math.abs(i - center) / center : 0;
+        const env = 0.3 + 0.7 * Math.cos((dist * Math.PI) / 2);
+        const jitter = 0.88 + 0.24 * Math.random();
+        const h = Math.max(
+          BAR_MIN,
+          Math.min(BAR_MAX, BAR_MIN + loud * env * jitter * (BAR_MAX - BAR_MIN)),
+        );
+        return <i key={i} style={{ height: `${h.toFixed(1)}px` }} />;
+      })}
     </div>
   );
 

@@ -25,13 +25,11 @@
      the card's max footprint (--ov-work-w for compact, --ov-open-w for Live),
      since the card is anchored flush to the screen edge in CSS. Keep overlay.rs
      in sync when these change. */
-  --ov-rest-w: 172px; /* resting compact pill (minimal, recording) -- roomy enough
-                         for the English working label before the grow starts */
-  --ov-pill-w: 184px; /* base width / Live pill before it opens or collapses */
-  --ov-work-w: 216px; /* working pill (transcribing / polishing) -- wide enough to
-                         center longer labels; shared by Live (collapsed) + minimal */
+  --ov-rest-w: 92px; /* resting compact pill (minimal, recording) — tuned "Tiny" */
+  --ov-pill-w: 110px; /* base width / Live pill before it opens or collapses */
+  --ov-work-w: 132px; /* working pill (transcribing / polishing) */
   --ov-open-w: 392px; /* Live panel, expanded */
-  --ov-base-h: 40px; /* control-row height (.sbase) */
+  --ov-base-h: 24px; /* control-row height (.sbase) */
   --ov-cap-max-h: 64px; /* max height of the scrolling live-text region */
 }
 @media (prefers-color-scheme: dark) {
@@ -118,7 +116,7 @@
 /* Shared base card. Flat: theme surface + hairline border, no shadow or blur. */
 .scard {
   width: var(--ov-pill-w);
-  border-radius: 24px;
+  border-radius: 14px;
   overflow: hidden;
   display: flex;
   flex-direction: column;
@@ -158,7 +156,7 @@
 }
 .scard.working {
   width: var(--ov-work-w);
-  border-radius: 18px;
+  border-radius: 14px;
 }
 
 /* Compact form: two fixed widths so the recording→working change is an animatable
@@ -243,29 +241,35 @@
    Same structure for pill & panel; the dot stays anchored left in both. */
 .sbase {
   height: var(--ov-base-h);
-  padding: 0 10px;
+  padding: 0;
   display: grid;
-  /* Equal side columns (min 22px to hold the cancel button) keep the center item
-     — waveform or label — centered whether the pill is at min width or content-
-     sized. */
-  grid-template-columns: minmax(22px, 1fr) auto minmax(22px, 1fr);
+  /* Equal side columns keep the centre item — waveform or label — centred. */
+  grid-template-columns: minmax(14px, 1fr) auto minmax(14px, 1fr);
   align-items: center;
 }
 .sbase-l {
   display: flex;
-  padding-left: 5px;
+  /* Inset the dot from the left edge by its vertical-centring gap, so it sits
+     equidistant from top, bottom and the left edge. */
+  padding-left: calc((var(--ov-base-h) - 5px) / 2);
   align-items: center;
   justify-self: start;
+}
+/* Working row: the spinner is larger than the dot, so use its own gap. */
+.sbase-l:has(.sspinner) {
+  padding-left: calc((var(--ov-base-h) - 13px) / 2);
 }
 .sbase-r {
   display: flex;
   align-items: center;
   gap: 10px;
   justify-self: end;
+  /* Mirror the dot: inset the cancel button by its own centring gap. */
+  padding-right: calc((var(--ov-base-h) - 16px) / 2);
 }
 .sdot {
-  width: 7px;
-  height: 7px;
+  width: 5px;
+  height: 5px;
   border-radius: 50%;
   background: var(--s-accent);
   flex: none;
@@ -276,7 +280,7 @@
     box-shadow: 0 0 0 0 var(--s-accent-soft);
   }
   70% {
-    box-shadow: 0 0 0 7px transparent;
+    box-shadow: 0 0 0 5px transparent;
   }
 }
 .stimer {
@@ -295,22 +299,22 @@
 .swave {
   display: flex;
   align-items: center;
-  gap: 3px;
+  gap: 2px;
   padding-right: 8px;
-  height: 18px;
+  height: 11px;
   flex: none;
 }
 .swave i {
-  width: 4px;
-  min-height: 3px;
-  max-height: 18px;
+  width: 3px;
+  min-height: 2px;
+  max-height: 11px;
   border-radius: 2px;
   background: var(--s-accent);
-  transition: height 80ms linear;
+  transition: height 55ms linear;
 }
 .sx {
-  width: 22px;
-  height: 22px;
+  width: 16px;
+  height: 16px;
   border-radius: 50%;
   flex: none;
   padding: 0;
@@ -329,8 +333,8 @@
     transform 100ms ease;
 }
 .sx svg {
-  width: 9px;
-  height: 9px;
+  width: 7px;
+  height: 7px;
   display: block;
 }
 .sx:hover {
@@ -358,7 +362,7 @@
   }
 }
 .swork-label {
-  font-size: 12px;
+  font-size: 10px;
   color: var(--s-muted);
   white-space: nowrap;
   padding: 0 8px; /* breathing room from the spinner / cancel when content-sized */
