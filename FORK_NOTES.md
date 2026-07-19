@@ -82,9 +82,12 @@ curl -fsSL -o src-tauri/resources/models/silero_vad_v4.onnx https://blob.handy.c
 
 ```bash
 export CMAKE_POLICY_VERSION_MINIMUM=3.5
-bun run tauri build      # release .app + .dmg  → src-tauri/target/release/bundle/macos/Handy.app
-# bun run tauri dev      # debug run; ALSO regenerates src/bindings.ts (tauri-specta)
+bun run tauri build          # release .app + .dmg  → src-tauri/target/release/bundle/macos/Handy.app
+# bun run tauri dev          # debug run; ALSO regenerates src/bindings.ts (tauri-specta)
+(cd src-tauri && cargo check)  # fast Rust type-check before a full build (~seconds incremental)
+(cd src-tauri && cargo test)   # unit tests — run after coordinator/settings changes
 ```
+- **Run `cargo test` (in `src-tauri/`) after touching the coordinator or settings** — the fork adds unit tests for the Hybrid state machine (hold / double-tap-latch / lone-tap) and settings back-fill/salvage; keep them green.
 - **First build is slow** (~10–25 min: whisper.cpp + onnxruntime + all Rust deps). Incremental rebuilds are ~30 s–2 min.
 - A harmless error at the very end — `A public key has been found, but no private key ... TAURI_SIGNING_PRIVATE_KEY` — is the auto-updater artifact signing. The `.app` is already built before it. Ignore, or disable the updater in `tauri.conf.json`.
 - `src/bindings.ts` is auto-generated and only re-exported on **debug** builds. Release builds don't regenerate it — fine unless the frontend needs new Rust types.
@@ -121,6 +124,7 @@ this cert (step 4 above) after copying a new build.**
 - Identity: `Handy Dev (Martin)`, SHA-1 `D01CBC8B3BE2C8661FBB4A4E7BECE27061FEEB35`
 - Keychain: `~/Library/Keychains/handy-signing.keychain-db` (password `handydev`)
 - Cert/key backup (outside the repo): `~/tools-for-agents/.handy-signing/`
+- **Expected steady state — don't mistake it for breakage:** since the cert is self-signed, `security find-identity -p codesigning` lists it as untrusted (`CSSMERR_TP_NOT_TRUSTED`, "0 valid identities found") and `spctl -a` reports the app `rejected`, permanently. That's normal — `codesign --sign <SHA> --keychain …` still signs fine and the app runs (TCC keys on the designated requirement, not on Gatekeeper trust). Only treat signing as broken if `codesign` itself fails with `<SHA>: no identity found` → run the recovery below.
 
 **First-time only:** self-signed apps fail Gatekeeper assessment (`spctl` → "rejected"),
 but a locally-built app still launches — the first launch may need Right-click → Open (or
