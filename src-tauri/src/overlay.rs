@@ -230,77 +230,84 @@ fn is_mouse_within_monitor(
 /// We must use LogicalPosition (not PhysicalPosition) because Tauri/tao
 /// converts PhysicalPosition using the scale factor of the monitor the window
 /// is *currently* on, which is wrong when moving cross-monitor.
-/// Detect whether the frontmost app's focused window is in native fullscreen,
-/// via the Accessibility API (the signal Wispr Flow uses). Handy already holds
-/// Accessibility permission for global shortcuts, so this needs nothing extra.
-/// Used to anchor the overlay to the physical screen bottom when a fullscreen
-/// space hides the Dock — macOS hands a background app the desktop's
-/// Dock-reserved work_area in that case, so work_area alone can't be trusted.
+/// Whether the Dock is currently presented on screen in the active space, asked
+/// directly of the window server (CGWindowList) rather than via a per-app
+/// Accessibility attribute. App-agnostic — it works the same for native apps and
+/// Electron apps (Claude, ChatGPT) in fullscreen, whereas `AXFullScreen` is
+/// unreliable on Electron. False in a fullscreen space (the Dock isn't part of
+/// that space) or when auto-hidden; true on a normal desktop with the Dock
+/// showing. Used to anchor the overlay: no Dock on screen -> physical bottom;
+/// Dock on screen -> above it (via work_area).
 #[cfg(target_os = "macos")]
-mod ax_fullscreen {
+mod dock_state {
     use core_foundation::base::TCFType;
     use core_foundation::string::CFString;
     use std::os::raw::c_void;
 
-    type CFTypeRef = *const c_void;
-    type CFStringRef = *const c_void;
+    type CFRef = *const c_void;
 
-    #[link(name = "ApplicationServices", kind = "framework")]
-    extern "C" {
-        fn AXIsProcessTrusted() -> u8;
-        fn AXUIElementCreateSystemWide() -> CFTypeRef;
-        fn AXUIElementCopyAttributeValue(
-            element: CFTypeRef,
-            attribute: CFStringRef,
-            value: *mut CFTypeRef,
-        ) -> i32;
-    }
     #[link(name = "CoreFoundation", kind = "framework")]
     extern "C" {
-        fn CFRelease(cf: CFTypeRef);
-        fn CFBooleanGetValue(boolean: CFTypeRef) -> u8;
+        fn CFArrayGetCount(array: CFRef) -> isize;
+        fn CFArrayGetValueAtIndex(array: CFRef, idx: isize) -> CFRef;
+        fn CFDictionaryGetValue(dict: CFRef, key: CFRef) -> CFRef;
+        fn CFNumberGetValue(number: CFRef, the_type: i32, value: *mut c_void) -> u8;
+        fn CFEqual(a: CFRef, b: CFRef) -> u8;
+        fn CFRelease(cf: CFRef);
+    }
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGWindowListCopyWindowInfo(option: u32, relative_to: u32) -> CFRef;
     }
 
-    unsafe fn copy_attr(element: CFTypeRef, name: &'static str) -> Option<CFTypeRef> {
-        if element.is_null() {
-            return None;
-        }
-        let attr = CFString::from_static_string(name);
-        let mut out: CFTypeRef = std::ptr::null();
-        let err =
-            AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef() as CFStringRef, &mut out);
-        if err == 0 && !out.is_null() {
-            Some(out)
-        } else {
-            None
-        }
-    }
+    const ON_SCREEN_ONLY: u32 = 1; // kCGWindowListOptionOnScreenOnly
+    const NULL_WINDOW: u32 = 0; // kCGNullWindowID
+    const NUMBER_INT: i32 = 9; // kCFNumberIntType
+    const DOCK_LAYER: i32 = 20; // kCGDockWindowLevel
 
-    /// True only if we can positively confirm the focused window is fullscreen.
-    /// Any uncertainty (no permission, query fails) returns false, so the caller
-    /// falls back to normal Dock-aware work-area positioning.
-    pub fn frontmost_is_fullscreen() -> bool {
+    pub fn dock_is_on_screen() -> bool {
         unsafe {
-            if AXIsProcessTrusted() == 0 {
+            let list = CGWindowListCopyWindowInfo(ON_SCREEN_ONLY, NULL_WINDOW);
+            if list.is_null() {
                 return false;
             }
-            let system = AXUIElementCreateSystemWide();
-            if system.is_null() {
-                return false;
-            }
-            let mut result = false;
-            if let Some(app) = copy_attr(system, "AXFocusedApplication") {
-                if let Some(window) = copy_attr(app, "AXFocusedWindow") {
-                    if let Some(fs) = copy_attr(window, "AXFullScreen") {
-                        result = CFBooleanGetValue(fs) != 0;
-                        CFRelease(fs);
-                    }
-                    CFRelease(window);
+            // Dictionary keys are the literal strings CGWindowList uses.
+            let key_layer = CFString::from_static_string("kCGWindowLayer");
+            let key_owner = CFString::from_static_string("kCGWindowOwnerName");
+            let dock_name = CFString::from_static_string("Dock");
+            let key_layer_ref = key_layer.as_concrete_TypeRef() as CFRef;
+            let key_owner_ref = key_owner.as_concrete_TypeRef() as CFRef;
+            let dock_name_ref = dock_name.as_concrete_TypeRef() as CFRef;
+
+            let count = CFArrayGetCount(list);
+            let mut found = false;
+            let mut i = 0isize;
+            while i < count {
+                let dict = CFArrayGetValueAtIndex(list, i);
+                i += 1;
+                if dict.is_null() {
+                    continue;
                 }
-                CFRelease(app);
+                // The Dock's tile bar lives at the dock window level (20); the
+                // Dock process also owns the desktop wallpaper (a very different,
+                // negative level), so the layer check excludes that.
+                let layer_val = CFDictionaryGetValue(dict, key_layer_ref);
+                if layer_val.is_null() {
+                    continue;
+                }
+                let mut layer: i32 = 0;
+                CFNumberGetValue(layer_val, NUMBER_INT, &mut layer as *mut i32 as *mut c_void);
+                if layer != DOCK_LAYER {
+                    continue;
+                }
+                let owner_val = CFDictionaryGetValue(dict, key_owner_ref);
+                if !owner_val.is_null() && CFEqual(owner_val, dock_name_ref) != 0 {
+                    found = true;
+                    break;
+                }
             }
-            CFRelease(system);
-            result
+            CFRelease(list);
+            found
         }
     }
 }
@@ -326,16 +333,15 @@ fn calculate_overlay_position(
             // space, so no monitor offset is added.
             #[cfg(target_os = "macos")]
             let bottom = {
-                if ax_fullscreen::frontmost_is_fullscreen() {
-                    // A fullscreen space hides the Dock, but macOS still reports
-                    // the desktop's Dock-reserved work_area to a background app.
-                    // Anchor to the physical screen bottom instead (Wispr-style).
-                    monitor_y + monitor.size().height as f64 / scale
-                } else {
-                    // Desktop: work_area already tracks the Dock — above it when
-                    // shown, near the screen edge when auto-hidden.
+                if dock_state::dock_is_on_screen() {
+                    // Dock is showing on this desktop: work_area already excludes
+                    // it, so the pill sits just above the Dock.
                     let wa = monitor.work_area();
                     (wa.position.y as f64 + wa.size.height as f64) / scale
+                } else {
+                    // Fullscreen space (native OR Electron) or auto-hidden Dock:
+                    // nothing reserves the bottom, so anchor to the physical edge.
+                    monitor_y + monitor.size().height as f64 / scale
                 }
             };
             #[cfg(not(target_os = "macos"))]
