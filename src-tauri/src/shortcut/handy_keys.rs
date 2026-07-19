@@ -428,9 +428,10 @@ pub fn init_shortcuts(app: &AppHandle) -> Result<(), String> {
     let default_bindings = settings::get_default_settings().bindings;
     let user_settings = settings::load_or_create_app_settings(app);
 
-    // Register all bindings except cancel (which is dynamic)
+    // Register all bindings except cancel + latch (both registered dynamically
+    // only while recording).
     for (id, default_binding) in default_bindings {
-        if id == "cancel" {
+        if id == "cancel" || id == "latch" {
             continue;
         }
         // Skip post-processing shortcut when the feature is disabled
@@ -496,6 +497,50 @@ pub fn unregister_cancel_shortcut(app: &AppHandle) {
             if let Some(cancel_binding) = get_settings(&app_clone).bindings.get("cancel").cloned() {
                 if let Some(state) = app_clone.try_state::<HandyKeysState>() {
                     let _ = state.unregister(&cancel_binding);
+                }
+            }
+        });
+    }
+}
+
+/// Register the hands-free latch shortcut (e.g. fn+space) while recording.
+pub fn register_latch_shortcut(app: &AppHandle) {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = app;
+        return;
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let app_clone = app.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Some(latch_binding) = get_settings(&app_clone).bindings.get("latch").cloned() {
+                if let Some(state) = app_clone.try_state::<HandyKeysState>() {
+                    if let Err(e) = state.register(&latch_binding) {
+                        error!("Failed to register latch shortcut: {}", e);
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Unregister the hands-free latch shortcut (called when recording stops)
+pub fn unregister_latch_shortcut(app: &AppHandle) {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = app;
+        return;
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let app_clone = app.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Some(latch_binding) = get_settings(&app_clone).bindings.get("latch").cloned() {
+                if let Some(state) = app_clone.try_state::<HandyKeysState>() {
+                    let _ = state.unregister(&latch_binding);
                 }
             }
         });

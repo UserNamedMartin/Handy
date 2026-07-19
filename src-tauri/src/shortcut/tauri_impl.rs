@@ -20,8 +20,8 @@ pub fn init_shortcuts(app: &AppHandle) {
 
     // Register all default shortcuts, applying user customizations
     for (id, default_binding) in default_bindings {
-        if id == "cancel" {
-            continue; // Skip cancel shortcut, it will be registered dynamically
+        if id == "cancel" || id == "latch" {
+            continue; // Skip cancel + latch; both registered dynamically while recording
         }
         // Skip post-processing shortcut when the feature is disabled
         if id == "transcribe_with_post_process" && !user_settings.post_process_enabled {
@@ -152,6 +152,18 @@ pub fn unregister_shortcut(app: &AppHandle, binding: ShortcutBinding) -> Result<
     })?;
 
     Ok(())
+}
+
+/// The hands-free latch (e.g. fn+space) uses the fn key, which the Tauri
+/// global-shortcut backend doesn't support — it's a handy-keys feature, so this
+/// is a no-op on the Tauri backend.
+pub fn register_latch_shortcut(app: &AppHandle) {
+    let _ = app;
+}
+
+/// No-op counterpart on the Tauri backend (see `register_latch_shortcut`).
+pub fn unregister_latch_shortcut(app: &AppHandle) {
+    let _ = app;
 }
 
 /// Register the cancel shortcut (called when recording starts)

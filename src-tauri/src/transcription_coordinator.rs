@@ -35,6 +35,8 @@ enum Command {
     Cancel {
         recording_was_active: bool,
     },
+    /// Lock an active Hybrid recording hands-free (Space while holding the key).
+    Latch,
     ProcessingFinished,
 }
 
@@ -374,6 +376,16 @@ impl TranscriptionCoordinator {
                                 stage = Stage::Idle;
                             }
                         }
+                        Command::Latch => {
+                            // Lock a live Hybrid recording hands-free: releasing
+                            // the key won't stop it; the next key press will.
+                            if hybrid.binding_id.is_some()
+                                && matches!(stage, Stage::Recording(_))
+                            {
+                                hybrid.latched = true;
+                                hybrid.pending_tap_deadline = None;
+                            }
+                        }
                         Command::ProcessingFinished => {
                             stage = Stage::Idle;
                         }
@@ -420,6 +432,13 @@ impl TranscriptionCoordinator {
             })
             .is_err()
         {
+            warn!("Transcription coordinator channel closed");
+        }
+    }
+
+    /// Lock the active Hybrid recording hands-free (Space while holding the key).
+    pub fn notify_latch(&self) {
+        if self.tx.send(Command::Latch).is_err() {
             warn!("Transcription coordinator channel closed");
         }
     }

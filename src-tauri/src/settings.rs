@@ -905,6 +905,26 @@ pub fn get_default_settings() -> AppSettings {
             activation_mode: ActivationMode::Global,
         },
     );
+    // Hands-free latch: while holding the (Hybrid) transcribe key and recording,
+    // press this to lock recording on — release the key and it keeps going; press
+    // the transcribe key again to stop. Registered only while recording.
+    #[cfg(target_os = "macos")]
+    let default_latch_shortcut = "fn+space";
+    #[cfg(not(target_os = "macos"))]
+    let default_latch_shortcut = "ctrl+space";
+    bindings.insert(
+        "latch".to_string(),
+        ShortcutBinding {
+            id: "latch".to_string(),
+            name: "Lock hands-free".to_string(),
+            description:
+                "While holding the transcribe key, press to keep recording without holding."
+                    .to_string(),
+            default_binding: default_latch_shortcut.to_string(),
+            current_binding: default_latch_shortcut.to_string(),
+            activation_mode: ActivationMode::Global,
+        },
+    );
 
     AppSettings {
         settings_schema_version: default_settings_schema_version(),

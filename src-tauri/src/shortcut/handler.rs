@@ -54,6 +54,17 @@ pub fn handle_shortcut_event(
         return;
     }
 
+    // Latch: lock a live Hybrid recording hands-free (fires only on press). Not
+    // in ACTION_MAP — handled here like a control key.
+    if binding_id == "latch" {
+        if is_pressed {
+            if let Some(coordinator) = app.try_state::<TranscriptionCoordinator>() {
+                coordinator.notify_latch();
+            }
+        }
+        return;
+    }
+
     let Some(action) = ACTION_MAP.get(binding_id) else {
         warn!(
             "No action defined in ACTION_MAP for shortcut ID '{}'. Shortcut: '{}', Pressed: {}",

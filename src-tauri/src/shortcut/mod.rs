@@ -74,6 +74,24 @@ pub fn unregister_cancel_shortcut(app: &AppHandle) {
     }
 }
 
+/// Register the hands-free latch shortcut (called when recording starts)
+pub fn register_latch_shortcut(app: &AppHandle) {
+    let settings = get_settings(app);
+    match settings.keyboard_implementation {
+        KeyboardImplementation::Tauri => tauri_impl::register_latch_shortcut(app),
+        KeyboardImplementation::HandyKeys => handy_keys::register_latch_shortcut(app),
+    }
+}
+
+/// Unregister the hands-free latch shortcut (called when recording stops)
+pub fn unregister_latch_shortcut(app: &AppHandle) {
+    let settings = get_settings(app);
+    match settings.keyboard_implementation {
+        KeyboardImplementation::Tauri => tauri_impl::unregister_latch_shortcut(app),
+        KeyboardImplementation::HandyKeys => handy_keys::unregister_latch_shortcut(app),
+    }
+}
+
 /// Register a shortcut using the appropriate implementation
 pub fn register_shortcut(app: &AppHandle, binding: ShortcutBinding) -> Result<(), String> {
     let settings = get_settings(app);

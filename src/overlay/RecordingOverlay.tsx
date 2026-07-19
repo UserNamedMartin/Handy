@@ -16,10 +16,10 @@ type OverlayState = "recording" | "streaming" | "transcribing" | "processing";
 
 // Number of reactive bars in the waveform. Mic levels arrive as 16 FFT buckets.
 const WAVE_BARS = 7;
-// Waveform response: overall loudness × gain, shaped by a symmetric centre
-// envelope so the bars pulse from the middle (not louder on the left). Tuned to
-// the "Tiny" look.
-const MIC_GAIN = 4.5;
+// Waveform response: peak voice loudness (√-curved for visibility) shaped by a
+// symmetric centre envelope, so the bars pulse from the middle and react clearly
+// at normal speaking volume. Tuned to the "Tiny" look.
+const MIC_GAIN = 1.7;
 const BAR_MIN = 2;
 const BAR_MAX = 11;
 
@@ -93,7 +93,7 @@ const RecordingOverlay: React.FC = () => {
         // bars for the shared waveform.
         const smoothed = smoothedLevelsRef.current.map((prev, i) => {
           const target = newLevels[i] || 0;
-          return prev * 0.7 + target * 0.3;
+          return prev * 0.6 + target * 0.4;
         });
         smoothedLevelsRef.current = smoothed;
         setLevels(smoothed.slice(0, WAVE_BARS));
@@ -158,10 +158,10 @@ const RecordingOverlay: React.FC = () => {
   // Overall voice loudness drives a symmetric, centre-tall envelope so the bars
   // pulse from the middle. Gain makes normal speech clearly visible.
   const center = (WAVE_BARS - 1) / 2;
-  const loud = Math.min(
-    1,
-    (levels.reduce((a, b) => a + b, 0) / (levels.length || 1)) * MIC_GAIN,
-  );
+  // Peak of the voice band (not the average — quiet buckets must not dilute it),
+  // with a sqrt curve so normal speech is clearly visible, not just shouting.
+  const peak = levels.length ? Math.max(...levels) : 0;
+  const loud = Math.min(1, Math.pow(peak, 0.5) * MIC_GAIN);
   const waveform = (
     <div className="swave">
       {Array.from({ length: WAVE_BARS }).map((_, i) => {
