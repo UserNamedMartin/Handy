@@ -77,6 +77,10 @@ pub struct AudioRecorder {
     vad: Option<VadConfig>,
     level_cb: Option<Arc<dyn Fn(Vec<f32>) + Send + Sync + 'static>>,
     audio_cb: Option<AudioFrameCallback>,
+    /// Conditionally boost quiet/whispered utterances up so they survive the
+    /// VAD gate (offline policy only; see `gain::whisper_autogain`). Normal-
+    /// volume speech is left untouched, so this is always-on rather than a mode.
+    whisper_autogain: bool,
     /// Preferred stream config cached per device name. The two HAL property
     /// queries in `get_preferred_config` cost ~40-85ms per open (worse on
     /// USB/Bluetooth), which lands on the keypress->capture path in on-demand
@@ -95,8 +99,15 @@ impl AudioRecorder {
             vad: None,
             level_cb: None,
             audio_cb: None,
+            whisper_autogain: true,
             config_cache: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Enable/disable the conditional whisper auto-gain (default on).
+    pub fn with_whisper_autogain(mut self, enabled: bool) -> Self {
+        self.whisper_autogain = enabled;
+        self
     }
 
     /// Attach a single VAD engine, reconfigured per session for the offline vs
@@ -159,6 +170,7 @@ impl AudioRecorder {
         let level_cb = self.level_cb.clone();
         // Move the optional real-time audio frame callback into the worker thread
         let audio_cb = self.audio_cb.clone();
+        let whisper_autogain = self.whisper_autogain;
         let config_cache = Arc::clone(&self.config_cache);
 
         let worker = std::thread::spawn(move || {
@@ -275,6 +287,7 @@ impl AudioRecorder {
                         cmd_rx,
                         level_cb,
                         audio_cb,
+                        whisper_autogain,
                         stop_flag,
                         stream_running_at,
                     );
@@ -521,6 +534,7 @@ fn run_consumer(
     cmd_rx: mpsc::Receiver<Cmd>,
     level_cb: Option<Arc<dyn Fn(Vec<f32>) + Send + Sync + 'static>>,
     audio_cb: Option<AudioFrameCallback>,
+    whisper_autogain: bool,
     stop_flag: Arc<AtomicBool>,
     stream_running_at: Instant,
 ) {
@@ -533,6 +547,9 @@ fn run_consumer(
     let mut processed_samples = Vec::<f32>::new();
     let mut recording = false;
     let mut vad_policy = VadPolicy::Offline;
+    // When set, this session buffers raw frames and applies the conditional
+    // whisper auto-gain + VAD at stop-time (see Cmd::Start / Cmd::Stop).
+    let mut offline_autogain = false;
 
     // ---------- latency instrumentation ---------------------------------- //
     // First-chunk arrival exposes the play()->samples-flowing gap; the
@@ -569,6 +586,7 @@ fn run_consumer(
         vad: &Option<VadConfig>,
         audio_cb: &Option<AudioFrameCallback>,
         out_buf: &mut Vec<f32>,
+        raw_capture: bool,
     ) {
         if !recording {
             return;
@@ -581,7 +599,10 @@ fn run_consumer(
             }
         };
 
-        if vad_policy == VadPolicy::Disabled {
+        // Offline whisper-autogain defers the VAD to stop-time (it needs the
+        // whole utterance's level to decide the boost), so here we just buffer
+        // the raw frames untouched.
+        if raw_capture || vad_policy == VadPolicy::Disabled {
             emit(samples);
             return;
         }
@@ -595,6 +616,32 @@ fn run_consumer(
         } else {
             emit(samples);
         }
+    }
+
+    // Offline whisper-autogain post-process: `raw` is the untouched captured
+    // audio. Boost quiet/whispered utterances up (normal voice is left alone by
+    // `whisper_autogain`), then run the same VAD over the result so only speech
+    // reaches transcription — exactly the live path, just deferred to stop.
+    fn autogain_then_vad(vad: &Option<VadConfig>, policy: VadPolicy, raw: &[f32]) -> Vec<f32> {
+        let boosted = super::whisper_autogain(raw);
+        let Some(cfg) = vad else {
+            return boosted;
+        };
+        const FRAME: usize = (constants::WHISPER_SAMPLE_RATE as usize) * 30 / 1000; // 480
+        let mut det = cfg.detector.lock().unwrap();
+        det.set_hangover_frames(cfg.hangover_for(policy));
+        det.reset();
+        let mut out = Vec::with_capacity(boosted.len());
+        for chunk in boosted.chunks(FRAME) {
+            if chunk.len() < FRAME {
+                break;
+            }
+            match det.push_frame(chunk).unwrap_or(VadFrame::Speech(chunk)) {
+                VadFrame::Speech(buf) => out.extend_from_slice(buf),
+                VadFrame::Noise => {}
+            }
+        }
+        out
     }
 
     // Runs until the stream closes and `recv` returns `Err`.
@@ -614,6 +661,9 @@ fn run_consumer(
                     awaiting_first_captured_chunk = Some(Instant::now());
                     stop_flag.store(false, Ordering::Relaxed);
                     vad_policy = policy;
+                    // Whisper auto-gain only applies to the offline (batch) path,
+                    // where the whole utterance is available before transcription.
+                    offline_autogain = whisper_autogain && policy == VadPolicy::Offline;
                     processed_samples.clear();
                     recording = true;
                     visualizer.reset();
@@ -644,6 +694,7 @@ fn run_consumer(
                                 &vad,
                                 &audio_cb,
                                 &mut processed_samples,
+                                offline_autogain,
                             )
                         });
                     }
@@ -663,6 +714,7 @@ fn run_consumer(
                                         &vad,
                                         &audio_cb,
                                         &mut processed_samples,
+                                        offline_autogain,
                                     )
                                 });
                             }
@@ -682,10 +734,17 @@ fn run_consumer(
                             &vad,
                             &audio_cb,
                             &mut processed_samples,
+                            offline_autogain,
                         )
                     });
 
-                    let _ = reply_tx.send(std::mem::take(&mut processed_samples));
+                    let final_samples = if offline_autogain {
+                        autogain_then_vad(&vad, vad_policy, &processed_samples)
+                    } else {
+                        std::mem::take(&mut processed_samples)
+                    };
+                    processed_samples.clear();
+                    let _ = reply_tx.send(final_samples);
 
                     // Resume the audio callback so the consumer loop can continue
                     // receiving chunks (important for always-on microphone mode).
@@ -730,6 +789,7 @@ fn run_consumer(
                 &vad,
                 &audio_cb,
                 &mut processed_samples,
+                offline_autogain,
             )
         });
 
