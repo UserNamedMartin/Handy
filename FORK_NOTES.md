@@ -114,6 +114,12 @@ brew uninstall --cask handy 2>/dev/null || true
 rm -rf /Applications/Handy.app
 cp -R src-tauri/target/release/bundle/macos/Handy.app /Applications/
 # 4. RE-SIGN with the stable local cert — REQUIRED every rebuild to keep TCC grants
+#    Unlock the signing keychain FIRST, or codesign pops a blocking GUI password
+#    prompt (and a headless/timed shell just hangs on it). The partition-list line
+#    grants codesign non-interactive access so it won't prompt again this session.
+security unlock-keychain -p handydev "$HOME/Library/Keychains/handy-signing.keychain-db"
+security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k handydev \
+  "$HOME/Library/Keychains/handy-signing.keychain-db" >/dev/null
 codesign --force --deep \
   --sign D01CBC8B3BE2C8661FBB4A4E7BECE27061FEEB35 \
   --keychain "$HOME/Library/Keychains/handy-signing.keychain-db" \
@@ -121,6 +127,9 @@ codesign --force --deep \
 xattr -cr /Applications/Handy.app
 open /Applications/Handy.app
 ```
+Verify the re-sign took: `codesign -dvvv /Applications/Handy.app` should show
+`Authority=Handy Dev (Martin)` (NOT `Signature=adhoc`). Adhoc means the re-sign
+didn't happen and TCC grants will reset.
 
 ### Stable code-signing (why there are no more permission re-grants)
 Ad-hoc signing changes the app's identity on every build, which resets macOS
@@ -143,11 +152,23 @@ System Settings → Privacy & Security → "Open Anyway"). Then enable **Handy**
 **If codesigning breaks — recreate the keychain from the backup p12.** This is a
 recurring gotcha, not a one-off: because signing uses a *separate* keychain (not the
 login keychain), a session/login reset can drop `codesign`'s access to the private key.
-The tell-tale symptom is `codesign` failing with **`<SHA>: no identity found`** even
-though `security find-identity -p codesigning` still lists the cert. Re-importing the
-*same* cert from the p12 fixes it, and because it's the same cert the **SHA (and your
-TCC grants) stay the same** — no permission re-grant needed:
+Tell-tale symptoms (any of these → run the recovery below):
+- `codesign` fails with **`<SHA>: no identity found`** even though `security find-identity
+  -p codesigning` still lists the cert; or
+- `codesign` fails with **`errSecInternalComponent`** and pops the GUI keychain-password
+  prompt; or
+- `security unlock-keychain -p handydev` is rejected with **"The user name or passphrase
+  you entered is not correct"** — i.e. the documented password no longer opens the
+  keychain (the file itself went bad, not the password). Recreating from the p12 with the
+  same `handydev` works because it's a fresh keychain.
+
+Re-importing the *same* cert from the p12 fixes all of these, and because it's the same
+cert the **SHA (and your TCC grants) stay the same** — no permission re-grant needed:
 ```bash
+# Remove the broken keychain first — create-keychain won't overwrite an existing
+# file, and if it's the "passphrase not correct" case you can't open it anyway.
+security delete-keychain ~/Library/Keychains/handy-signing.keychain-db 2>/dev/null || true
+rm -f ~/Library/Keychains/handy-signing.keychain-db
 security create-keychain -p handydev ~/Library/Keychains/handy-signing.keychain-db
 security unlock-keychain  -p handydev ~/Library/Keychains/handy-signing.keychain-db
 security import ~/tools-for-agents/.handy-signing/handy.p12 \
