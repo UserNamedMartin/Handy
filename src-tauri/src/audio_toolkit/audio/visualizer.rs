@@ -1,7 +1,14 @@
 use rustfft::{num_complex::Complex32, Fft, FftPlanner};
 use std::sync::Arc;
 
-const DB_MIN: f32 = -55.0;
+// DB_MIN is the loudness mapped to "bar at rest". Nudged -55 → -58 to open the
+// low end a little so quiet speech occupies more of the 0..1 range, kept
+// conservative so a quiet room's idle bands still map to ~0 (the bulk of the
+// sensitivity increase is the multiplicative MIC_GAIN/curve in the overlay
+// .tsx, which is safe regardless of absolute mic level). Visual only — does not
+// affect VAD or transcription. Drop toward -62 for more quiet reach; raise back
+// toward -55 if idle jitters in a noisier room.
+const DB_MIN: f32 = -58.0;
 const DB_MAX: f32 = -8.0;
 const GAIN: f32 = 1.3;
 const CURVE_POWER: f32 = 0.7;

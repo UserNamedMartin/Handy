@@ -19,7 +19,11 @@ const WAVE_BARS = 7;
 // Waveform response: peak voice loudness (√-curved for visibility) shaped by a
 // symmetric centre envelope, so the bars pulse from the middle and react clearly
 // at normal speaking volume. Tuned to the "Tiny" look.
-const MIC_GAIN = 1.7;
+const MIC_GAIN = 2.3;
+// Loudness curve exponent: <1 lifts quiet input more than loud, so the response
+// is progressive (quiet speech moves the bars more without loud speech
+// overshooting the cap). Lower = more sensitive to quiet.
+const MIC_CURVE = 0.45;
 const BAR_MIN = 2;
 const BAR_MAX = 11;
 
@@ -161,7 +165,7 @@ const RecordingOverlay: React.FC = () => {
   // Peak of the voice band (not the average — quiet buckets must not dilute it),
   // with a sqrt curve so normal speech is clearly visible, not just shouting.
   const peak = levels.length ? Math.max(...levels) : 0;
-  const loud = Math.min(1, Math.pow(peak, 0.5) * MIC_GAIN);
+  const loud = Math.min(1, Math.pow(peak, MIC_CURVE) * MIC_GAIN);
   const waveform = (
     <div className="swave">
       {Array.from({ length: WAVE_BARS }).map((_, i) => {
