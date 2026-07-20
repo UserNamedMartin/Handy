@@ -70,6 +70,18 @@ impl VadConfig {
 /// policy while recording. Used to feed a live streaming transcription as audio arrives.
 pub type AudioFrameCallback = Arc<dyn Fn(&[f32]) + Send + Sync + 'static>;
 
+/// Debug snapshot of the last offline capture: the untouched raw audio plus how
+/// the auto-gain and VAD stages treated it. Populated at stop when the offline
+/// (whisper-autogain) path runs; consumed by the debug-capture logger.
+#[derive(Clone)]
+pub struct CaptureDebug {
+    pub raw: Vec<f32>,
+    pub autogain_db: f32,
+    pub classified_whisper: bool,
+    pub vad_frames_in: usize,
+    pub vad_frames_kept: usize,
+}
+
 pub struct AudioRecorder {
     device: Option<Device>,
     cmd_tx: Option<mpsc::Sender<Cmd>>,
@@ -81,6 +93,9 @@ pub struct AudioRecorder {
     /// VAD gate (offline policy only; see `gain::whisper_autogain`). Normal-
     /// volume speech is left untouched, so this is always-on rather than a mode.
     whisper_autogain: bool,
+    /// Debug snapshot of the last offline capture (raw audio + gain/VAD stats),
+    /// shared with the consumer thread. `take_capture_debug` drains it.
+    capture_debug: Arc<Mutex<Option<CaptureDebug>>>,
     /// Preferred stream config cached per device name. The two HAL property
     /// queries in `get_preferred_config` cost ~40-85ms per open (worse on
     /// USB/Bluetooth), which lands on the keypress->capture path in on-demand
@@ -100,6 +115,7 @@ impl AudioRecorder {
             level_cb: None,
             audio_cb: None,
             whisper_autogain: true,
+            capture_debug: Arc::new(Mutex::new(None)),
             config_cache: Arc::new(Mutex::new(None)),
         })
     }
@@ -108,6 +124,11 @@ impl AudioRecorder {
     pub fn with_whisper_autogain(mut self, enabled: bool) -> Self {
         self.whisper_autogain = enabled;
         self
+    }
+
+    /// Drain the debug snapshot of the most recent offline capture, if any.
+    pub fn take_capture_debug(&self) -> Option<CaptureDebug> {
+        self.capture_debug.lock().unwrap().take()
     }
 
     /// Attach a single VAD engine, reconfigured per session for the offline vs
@@ -171,6 +192,7 @@ impl AudioRecorder {
         // Move the optional real-time audio frame callback into the worker thread
         let audio_cb = self.audio_cb.clone();
         let whisper_autogain = self.whisper_autogain;
+        let capture_debug = Arc::clone(&self.capture_debug);
         let config_cache = Arc::clone(&self.config_cache);
 
         let worker = std::thread::spawn(move || {
@@ -288,6 +310,7 @@ impl AudioRecorder {
                         level_cb,
                         audio_cb,
                         whisper_autogain,
+                        capture_debug,
                         stop_flag,
                         stream_running_at,
                     );
@@ -535,6 +558,7 @@ fn run_consumer(
     level_cb: Option<Arc<dyn Fn(Vec<f32>) + Send + Sync + 'static>>,
     audio_cb: Option<AudioFrameCallback>,
     whisper_autogain: bool,
+    capture_debug: Arc<Mutex<Option<CaptureDebug>>>,
     stop_flag: Arc<AtomicBool>,
     stream_running_at: Instant,
 ) {
@@ -622,26 +646,37 @@ fn run_consumer(
     // audio. Boost quiet/whispered utterances up (normal voice is left alone by
     // `whisper_autogain`), then run the same VAD over the result so only speech
     // reaches transcription — exactly the live path, just deferred to stop.
-    fn autogain_then_vad(vad: &Option<VadConfig>, policy: VadPolicy, raw: &[f32]) -> Vec<f32> {
-        let boosted = super::whisper_autogain(raw);
+    // Returns (gated_audio, applied_gain_db, classified_as_whisper,
+    // vad_frames_in, vad_frames_kept) — the extra fields feed debug capture.
+    fn autogain_then_vad(
+        vad: &Option<VadConfig>,
+        policy: VadPolicy,
+        raw: &[f32],
+    ) -> (Vec<f32>, f32, bool, usize, usize) {
+        let (boosted, gain_db, classified) = super::whisper_autogain_with_meta(raw);
         let Some(cfg) = vad else {
-            return boosted;
+            return (boosted, gain_db, classified, 0, 0);
         };
         const FRAME: usize = (constants::WHISPER_SAMPLE_RATE as usize) * 30 / 1000; // 480
         let mut det = cfg.detector.lock().unwrap();
         det.set_hangover_frames(cfg.hangover_for(policy));
         det.reset();
         let mut out = Vec::with_capacity(boosted.len());
+        let (mut frames_in, mut frames_kept) = (0usize, 0usize);
         for chunk in boosted.chunks(FRAME) {
             if chunk.len() < FRAME {
                 break;
             }
+            frames_in += 1;
             match det.push_frame(chunk).unwrap_or(VadFrame::Speech(chunk)) {
-                VadFrame::Speech(buf) => out.extend_from_slice(buf),
+                VadFrame::Speech(buf) => {
+                    frames_kept += 1;
+                    out.extend_from_slice(buf);
+                }
                 VadFrame::Noise => {}
             }
         }
-        out
+        (out, gain_db, classified, frames_in, frames_kept)
     }
 
     // Runs until the stream closes and `recv` returns `Err`.
@@ -739,7 +774,18 @@ fn run_consumer(
                     });
 
                     let final_samples = if offline_autogain {
-                        autogain_then_vad(&vad, vad_policy, &processed_samples)
+                        // `processed_samples` holds the untouched raw capture here.
+                        let raw = std::mem::take(&mut processed_samples);
+                        let (out, gain_db, classified, frames_in, frames_kept) =
+                            autogain_then_vad(&vad, vad_policy, &raw);
+                        *capture_debug.lock().unwrap() = Some(CaptureDebug {
+                            raw,
+                            autogain_db: gain_db,
+                            classified_whisper: classified,
+                            vad_frames_in: frames_in,
+                            vad_frames_kept: frames_kept,
+                        });
+                        out
                     } else {
                         std::mem::take(&mut processed_samples)
                     };

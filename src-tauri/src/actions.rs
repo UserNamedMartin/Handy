@@ -772,6 +772,64 @@ impl ShortcutAction for TranscribeAction {
                                 return;
                             }
 
+                            // Debug capture (fork feature): raw audio + rich
+                            // metadata for offline analysis. Native history is
+                            // untouched. Best-effort — must never break output.
+                            let dbg_settings = crate::settings::get_settings(&ah);
+                            if dbg_settings.debug_capture {
+                                if let Some(dbg) = rm.take_capture_debug() {
+                                    let raw = dbg.raw;
+                                    let n = raw.len().max(1) as f32;
+                                    let rms = (raw.iter().map(|x| x * x).sum::<f32>() / n).sqrt();
+                                    let peak = raw.iter().fold(0f32, |m, x| m.max(x.abs()));
+                                    let dbfs =
+                                        |a: f32| if a > 0.0 { 20.0 * a.log10() } else { -99.0 };
+                                    let ts = chrono::Utc::now().timestamp();
+                                    let meta = serde_json::json!({
+                                        "timestamp": ts,
+                                        "binding_id": binding_id.clone(),
+                                        "transcribe_ms": transcription_time.elapsed().as_millis() as u64,
+                                        "audio": {
+                                            "raw_duration_s": raw.len() as f32 / 16_000.0,
+                                            "raw_rms_dbfs": dbfs(rms),
+                                            "raw_peak_dbfs": dbfs(peak),
+                                        },
+                                        "autogain": {
+                                            "classified_whisper": dbg.classified_whisper,
+                                            "applied_gain_db": dbg.autogain_db,
+                                        },
+                                        "vad": {
+                                            "frames_in": dbg.vad_frames_in,
+                                            "frames_kept": dbg.vad_frames_kept,
+                                            "kept_ratio": if dbg.vad_frames_in > 0 {
+                                                dbg.vad_frames_kept as f32 / dbg.vad_frames_in as f32
+                                            } else { 0.0 },
+                                        },
+                                        "transcription": {
+                                            "raw_text": transcription.clone(),
+                                            "final_text": processed.final_text.clone(),
+                                            "post_processed": processed.post_processed_text.clone(),
+                                        },
+                                        "post_process": { "requested": post_process },
+                                        "settings": {
+                                            "selected_model": dbg_settings.selected_model,
+                                            "vad_enabled": dbg_settings.vad_enabled,
+                                        },
+                                    });
+                                    let root =
+                                        crate::debug_capture::debug_root(hm.recordings_dir());
+                                    if let Err(e) = crate::debug_capture::write_bundle(
+                                        &root,
+                                        ts,
+                                        &raw,
+                                        &meta,
+                                        dbg_settings.debug_capture_limit,
+                                    ) {
+                                        error!("debug capture failed: {}", e);
+                                    }
+                                }
+                            }
+
                             // Save to history if WAV was saved
                             if wav_saved {
                                 if let Err(err) = hm.save_entry(

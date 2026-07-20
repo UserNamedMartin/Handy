@@ -501,6 +501,13 @@ pub struct AppSettings {
     pub extra_recording_buffer_ms: u64,
     #[serde(default = "default_vad_enabled")]
     pub vad_enabled: bool,
+    /// Fork feature: write a rich debug bundle (raw audio + gain/VAD/timing
+    /// metadata) per dictation for later offline analysis. On by default.
+    #[serde(default = "default_debug_capture")]
+    pub debug_capture: bool,
+    /// How many debug bundles to keep before pruning the oldest.
+    #[serde(default = "default_debug_capture_limit")]
+    pub debug_capture_limit: usize,
     /// Which recording overlay to show: None / Minimal / Live. Streaming mode is
     /// not gated on this — that follows model capability. Migrated from the old
     /// `overlay_position` (position `none` → style `None`).
@@ -571,6 +578,14 @@ fn default_overlay_style() -> OverlayStyle {
 
 fn default_vad_enabled() -> bool {
     true
+}
+
+fn default_debug_capture() -> bool {
+    true
+}
+
+fn default_debug_capture_limit() -> usize {
+    200
 }
 
 fn default_debug_mode() -> bool {
@@ -983,6 +998,8 @@ pub fn get_default_settings() -> AppSettings {
         transcribe_gpu_device: default_transcribe_gpu_device(),
         extra_recording_buffer_ms: 0,
         vad_enabled: default_vad_enabled(),
+        debug_capture: default_debug_capture(),
+        debug_capture_limit: default_debug_capture_limit(),
         overlay_style: default_overlay_style(),
     }
 }

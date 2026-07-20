@@ -74,6 +74,18 @@ pub fn whisper_autogain(samples: &[f32]) -> Vec<f32> {
     samples.iter().map(|&x| (x * lin).clamp(-1.0, 1.0)).collect()
 }
 
+/// Like [`whisper_autogain`] but also returns the applied gain (dB) and whether
+/// the utterance was classified as a whisper — for debug logging.
+pub fn whisper_autogain_with_meta(samples: &[f32]) -> (Vec<f32>, f32, bool) {
+    let (gain_db, is_whisper) = autogain_db(samples);
+    if gain_db <= 0.0 {
+        return (samples.to_vec(), gain_db, is_whisper);
+    }
+    let lin = 10f32.powf(gain_db / 20.0);
+    let out = samples.iter().map(|&x| (x * lin).clamp(-1.0, 1.0)).collect();
+    (out, gain_db, is_whisper)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

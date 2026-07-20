@@ -535,6 +535,16 @@ impl AudioRecordingManager {
         self.cancel_generation.load(Ordering::Acquire) != generation
     }
 
+    /// Drain the debug snapshot (raw audio + gain/VAD stats) of the most recent
+    /// offline capture, for the debug-capture logger. `None` if unavailable.
+    pub fn take_capture_debug(&self) -> Option<crate::audio_toolkit::CaptureDebug> {
+        self.recorder
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|rec| rec.take_capture_debug())
+    }
+
     pub fn stop_recording(&self, binding_id: &str, cancel_generation: u64) -> Option<Vec<f32>> {
         let mut state = self.state.lock().unwrap();
 
