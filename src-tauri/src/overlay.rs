@@ -40,19 +40,29 @@ tauri_panel! {
 // where the card sits — only OVERLAY_TOP_OFFSET / OVERLAY_BOTTOM_OFFSET do. Keep
 // these in sync with the CSS card geometry.
 //
-// Compact overlay (Minimal / transcribing / processing): the 40h pill animates
-// width from 172 (--ov-rest-w) to 216 (--ov-work-w) and expands from center, so
+// Compact overlay (Minimal / transcribing / processing): the 24h pill animates
+// width from 92 (--ov-rest-w) to 132 (--ov-work-w) and expands from center, so
 // the window must fit the widest state plus a little slack.
-const OVERLAY_WIDTH: f64 = 256.0;
-const OVERLAY_HEIGHT: f64 = 46.0;
+// This window is not just a canvas — it swallows every click inside it, so any
+// slack beyond the card is dead space over whatever sits underneath. These
+// previously described a 172/216-wide, 40-tall pill that the fork's "Tiny"
+// retune replaced, leaving ~80 px of click-eating margin either side of a 92 px
+// pill. Keep them in sync with the `--ov-*` vars in RecordingOverlay.css.
+const OVERLAY_WIDTH: f64 = 144.0;
+const OVERLAY_HEIGHT: f64 = 34.0;
 
-// Actual is 394x118, just a little extra
+// The Live panel opens to 392x118 (--ov-open-w plus the text region), so its
+// window must fit the expanded form even while the pill is still small.
 const OVERLAY_STREAM_WIDTH: f64 = 400.0;
 const OVERLAY_STREAM_HEIGHT: f64 = 120.0;
 
 /// Overlay window size (logical) for a given UI state.
-fn overlay_dimensions(state: &str) -> (f64, f64) {
-    if state == "streaming" {
+///
+/// `live_text` is [`crate::settings::AppSettings::show_live_transcript`]. With it
+/// off the streaming card never opens into a panel, so reserving panel-sized
+/// window would leave 400x120 of dead click area around a 92 px pill.
+fn overlay_dimensions(state: &str, live_text: bool) -> (f64, f64) {
+    if state == "streaming" && live_text {
         (OVERLAY_STREAM_WIDTH, OVERLAY_STREAM_HEIGHT)
     } else {
         (OVERLAY_WIDTH, OVERLAY_HEIGHT)
@@ -558,7 +568,7 @@ fn show_overlay_state(app_handle: &AppHandle, state: &str) {
     }
 
     // Size the overlay for this state (compact vs. streaming), then position it.
-    let (width, height) = overlay_dimensions(state);
+    let (width, height) = overlay_dimensions(state, settings.show_live_transcript);
     if let Some(overlay_window) = app_handle.get_webview_window("recording_overlay") {
         #[cfg(target_os = "linux")]
         update_gtk_layer_shell_anchors(&overlay_window);
@@ -659,7 +669,8 @@ pub fn update_overlay_position(app_handle: &AppHandle) {
             } else {
                 "recording"
             };
-            let (width, height) = overlay_dimensions(state);
+            let live_text = settings::get_settings(app_handle).show_live_transcript;
+            let (width, height) = overlay_dimensions(state, live_text);
             if let Err(error) = place_windows_overlay(app_handle, &overlay_window, width, height) {
                 log::error!("Failed to update recording overlay position: {error}");
             }

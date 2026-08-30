@@ -1,5 +1,10 @@
-use crate::audio_toolkit::{apply_custom_words, filter_transcription_output};
+use crate::audio_toolkit::{
+    apply_custom_words, filter_transcription_output, whisper_autogain, SegmentClose,
+    StreamSegmenter, StreamSegmenterConfig,
+};
 use crate::managers::audio::AudioRecordingManager;
+use crate::cloud::gemini::GeminiTranscriber;
+use crate::cloud::gemini_live::{join_finals, GeminiLiveSession, LiveEvent};
 use crate::managers::model::{EngineType, ModelManager};
 use crate::settings::{
     get_settings, AppSettings, ModelUnloadTimeout, OrtAcceleratorSetting,
@@ -35,6 +40,69 @@ use transcribe_rs::{
 
 const STREAM_PERF_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const STREAM_FINALIZE_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Style primer fed to whisper-family models as the `initial_prompt`.
+///
+/// whisper's `initial_prompt` is a *style example*, not an instruction — the
+/// model continues in the prompt's style. This one is a short, well-punctuated
+/// mixed Russian/English snippet with English tech terms kept in Latin script,
+/// so the model mirrors that: proper punctuation/capitalization and English
+/// terms written in Latin rather than transliterated to Cyrillic.
+///
+/// Measured on a 195-clip corpus of real dictations (turbo & large-v3, scored
+/// against a cloud-consensus reference): vs no prompt this lifts punctuation
+/// F1 ~73→84, roughly doubles Latin-term retention (~29%→49%), and slightly
+/// improves CER. It stays well under whisper's 224-token prompt budget. Applied
+/// per decode window (we run with condition_on_prev_tokens = false), so it
+/// keeps steering the style across long, multi-window dictations.
+const WHISPER_STYLE_PRIMER: &str = "Окей, смотри. Давай сделаем так: я закоммичу изменения, открою pull request и смержу его в main. Потом проверю deploy и логи на staging. В целом всё выглядит нормально, so let's ship it.";
+
+/// One recorder audio frame: 30 ms at the 16 kHz whisper rate. The recorder's
+/// resampler emits exactly one such frame per `StreamRouter::feed`.
+const WHISPER_FRAME_SAMPLES: usize = 480;
+/// RMS below this counts a frame as silence for pseudo-streaming pause
+/// detection (~-50 dBFS). Only used to place segment cuts at pauses — each
+/// segment is transcribed WHOLE, so a misclassified frame just shifts a cut,
+/// it never drops audio. Kept low so quiet speech isn't mistaken for a pause
+/// (raw dictation sits around -38 dBFS; real pauses are far quieter).
+const WHISPER_STREAM_SILENCE_RMS: f32 = 0.003;
+
+/// Builds the whisper `initial_prompt`: the style primer, with any user custom
+/// words appended so they're both style-primed and more likely to be spelled as
+/// written. `None` only if there is somehow no text at all.
+fn whisper_initial_prompt(custom_words: &[String]) -> Option<String> {
+    if custom_words.is_empty() {
+        Some(WHISPER_STYLE_PRIMER.to_string())
+    } else {
+        Some(format!("{} {}", WHISPER_STYLE_PRIMER, custom_words.join(", ")))
+    }
+}
+
+/// Transcribe one completed pseudo-streaming segment on the leased whisper
+/// session (auto-gained like the offline path) and return its text. Silent or
+/// sub-frame segments return `None`; a panic inside transcribe-cpp is contained
+/// so one bad segment can't take down the worker.
+fn transcribe_whisper_segment(
+    engine: &mut LoadedEngine,
+    audio: &[f32],
+    opts: &RunOptions,
+) -> Option<String> {
+    if audio.len() < WHISPER_FRAME_SAMPLES || audio.iter().all(|s| *s == 0.0) {
+        return None;
+    }
+    let boosted = whisper_autogain(audio);
+    if let LoadedEngine::TranscribeCpp(session) = engine {
+        match catch_unwind(AssertUnwindSafe(|| session.run(&boosted, opts))) {
+            Ok(Ok(t)) => {
+                let text = t.text.trim().to_string();
+                return (!text.is_empty()).then_some(text);
+            }
+            Ok(Err(e)) => warn!("whisper stream segment failed: {}", e),
+            Err(_) => warn!("whisper stream segment panicked; skipping"),
+        }
+    }
+    None
+}
 
 fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
@@ -178,6 +246,9 @@ enum LoadedEngine {
     GigaAM(GigaAMModel),
     Canary(CanaryModel),
     Cohere(CohereModel),
+    /// The one non-local engine: an HTTP client, not a model. Nothing is
+    /// resident, so unload/reload is free and the unload timeout is moot.
+    Gemini(GeminiTranscriber),
 }
 
 /// RAII guard that clears the `is_loading` flag and notifies waiters on drop.
@@ -507,7 +578,13 @@ impl TranscriptionManager {
             return Err(anyhow::anyhow!(error_msg));
         }
 
-        let model_path = self.model_manager.get_model_path(model_id)?;
+        // Cloud engines have no file to resolve, and asking for one errors.
+        // Every local branch below uses `model_path`; the cloud branch ignores it.
+        let model_path = if matches!(model_info.engine_type, EngineType::Gemini) {
+            std::path::PathBuf::new()
+        } else {
+            self.model_manager.get_model_path(model_id)?
+        };
 
         // Drop the current engine BEFORE building the new one so transcribe-cpp
         // frees the previous native context first — avoids holding two models at
@@ -668,6 +745,28 @@ impl TranscriptionManager {
                     anyhow::anyhow!(error_msg)
                 })?;
                 LoadedEngine::Cohere(engine)
+            }
+            EngineType::Gemini => {
+                // "Loading" is just wiring up credentials — no bytes, no
+                // warm-up. The one failure mode is a missing API key, which we
+                // surface here rather than at the end of the user's first
+                // dictation.
+                let settings = get_settings(&self.app_handle);
+                let api_key = settings
+                    .cloud_api_keys
+                    .get(crate::cloud::gemini::PROVIDER_ID)
+                    .cloned()
+                    .unwrap_or_default();
+
+                let engine = GeminiTranscriber::new(
+                    api_key,
+                    crate::cloud::gemini::API_MODEL.to_string(),
+                )
+                .map_err(|e| {
+                    emit_loading_failed(&e.to_string());
+                    e
+                })?;
+                LoadedEngine::Gemini(engine)
             }
         };
 
@@ -849,6 +948,14 @@ impl TranscriptionManager {
             }
         };
 
+        // The cloud engine streams over its own WebSocket rather than through
+        // transcribe-cpp, so it branches out before the capability probe below
+        // (which only knows how to interrogate a local session).
+        if matches!(engine, LoadedEngine::Gemini(_)) && model_id == crate::cloud::gemini_live::LIVE_MODEL_ID {
+            self.run_gemini_live_worker(engine, rx, &model_id);
+            return;
+        }
+
         // Only transcribe-cpp models expose streaming; ONNX engines fall back to
         // batch. The loaded session (not the ModelManager copy) is the source of
         // truth for run-path capabilities.
@@ -883,6 +990,19 @@ impl TranscriptionManager {
         };
 
         if !supports_streaming {
+            // Fork feature: whisper isn't a streaming arch, but with the
+            // `whisper_streaming` setting on we run our own pseudo-streaming —
+            // segment the incoming frames at silence pauses and batch-transcribe
+            // completed segments on this same leased session while recording
+            // continues. Replies to Finalize with the concatenated text, exactly
+            // like the native streaming worker, so actions.rs consumes it the
+            // same way (and still falls back to batch if it yields nothing).
+            let is_whisper = matches!(&engine,
+                LoadedEngine::TranscribeCpp(s) if s.model().arch() == "whisper");
+            if is_whisper && get_settings(&self.app_handle).whisper_streaming {
+                self.run_whisper_segment_worker(engine, rx, &model_id, supports_translate, &languages);
+                return;
+            }
             self.return_engine(engine, &model_id);
             self.router.clear();
             drain_until_finalize(rx);
@@ -1032,6 +1152,198 @@ impl TranscriptionManager {
         // the engine has been returned to the pool.
     }
 
+    /// Fork feature: whisper pseudo-streaming worker. Owns the leased engine for
+    /// the whole recording: segments the incoming 16 kHz frames at silence pauses
+    /// (see [`StreamSegmenter`]) and batch-transcribes each completed segment on
+    /// the session with the style primer, while the user keeps talking. On
+    /// Finalize it transcribes the open tail and replies with the concatenated
+    /// text — the same contract as the native streaming worker, so `actions.rs`
+    /// consumes it identically (and still batch-falls-back if it's empty).
+    fn run_whisper_segment_worker(
+        &self,
+        mut engine: LoadedEngine,
+        rx: mpsc::Receiver<StreamCmd>,
+        model_id: &str,
+        supports_translate: bool,
+        languages: &[String],
+    ) {
+        let settings = get_settings(&self.app_handle);
+        let effective_language =
+            effective_language_for_model(&settings, self.model_manager.as_ref(), model_id);
+        let run_plan = transcribe_cpp_run_plan(
+            settings.translate_to_english,
+            &effective_language,
+            languages,
+            supports_translate,
+        );
+        // Same decode options as the offline whisper path (primer +
+        // condition_on_prev=false), rebuilt per segment since RunOptions isn't Clone.
+        let make_opts = || RunOptions {
+            task: run_plan.task,
+            language: run_plan.language.clone(),
+            target_language: run_plan.target_language.clone(),
+            family: Some(RunExtension::Whisper(WhisperRunOptions {
+                initial_prompt: whisper_initial_prompt(&settings.custom_words),
+                condition_on_prev_tokens: Some(false),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        let mut segmenter = StreamSegmenter::new(StreamSegmenterConfig::default());
+        let mut seg_buf: Vec<f32> = Vec::new();
+        // Samples per fed frame, parallel to the segmenter's frame counting, so
+        // we map a frame-denominated SegmentClose back to sample offsets without
+        // assuming a fixed frame size.
+        let mut feed_lens: Vec<usize> = Vec::new();
+        let mut parts: Vec<String> = Vec::new();
+
+        // Debug capture for the streaming path (mirrors the offline debug bundle
+        // but records the segmentation): the full raw audio + per-segment
+        // boundaries/timings/text, so a bad streamed transcript can be replayed
+        // and diagnosed offline. Gated on the same `debug_capture` setting.
+        let sr = 16_000usize; // whisper sample rate (same basis as WHISPER_FRAME_SAMPLES)
+        let capture = settings.debug_capture;
+        let mut full_audio: Vec<f32> = Vec::new();
+        let mut seg_meta: Vec<serde_json::Value> = Vec::new();
+        let mut cursor: usize = 0; // samples consumed into closed segments
+        let worker_t0 = Instant::now();
+
+        info!(
+            "whisper pseudo-streaming worker started (model '{}')",
+            model_id
+        );
+
+        let mut record_segment =
+            |engine: &mut LoadedEngine, seg: &[f32], speech_samples: usize, span_samples: usize| {
+                let seg_t0 = Instant::now();
+                let text = transcribe_whisper_segment(engine, seg, &make_opts());
+                let start_ms = cursor * 1000 / sr;
+                let end_ms = (cursor + span_samples) * 1000 / sr;
+                let speech_ms = speech_samples * 1000 / sr;
+                cursor += span_samples;
+                info!(
+                    "whisper stream segment {}: {}..{} ms (speech {} ms), transcribe {} ms -> {:?}",
+                    seg_meta.len(),
+                    start_ms,
+                    end_ms,
+                    speech_ms,
+                    seg_t0.elapsed().as_millis(),
+                    text.as_deref().unwrap_or("<empty>")
+                );
+                if capture {
+                    seg_meta.push(serde_json::json!({
+                        "index": seg_meta.len(),
+                        "start_ms": start_ms,
+                        "end_ms": end_ms,
+                        "speech_ms": speech_ms,
+                        "speech_samples": speech_samples,
+                        "transcribe_ms": seg_t0.elapsed().as_millis() as u64,
+                        "text": text,
+                    }));
+                }
+                if let Some(t) = text {
+                    parts.push(t);
+                }
+            };
+
+        let mut finalize_reply: Option<mpsc::Sender<Option<String>>> = None;
+        while let Ok(cmd) = rx.recv() {
+            match cmd {
+                StreamCmd::Feed(pcm) => {
+                    self.touch_activity();
+                    let rms = (pcm.iter().map(|s| s * s).sum::<f32>()
+                        / pcm.len().max(1) as f32)
+                        .sqrt();
+                    if capture {
+                        full_audio.extend_from_slice(&pcm);
+                    }
+                    seg_buf.extend_from_slice(&pcm);
+                    feed_lens.push(pcm.len());
+                    if let Some(SegmentClose {
+                        frames,
+                        trailing_silence_frames,
+                    }) = segmenter.push(rms > WHISPER_STREAM_SILENCE_RMS)
+                    {
+                        // Map the frame-denominated close to sample offsets via the
+                        // recorded per-frame lengths. The closed segment spans the
+                        // first `frames` frames; trim the trailing silence frames so
+                        // it ends on the last speech.
+                        // Transcribe the WHOLE segment (do NOT trim the trailing
+                        // silence): whisper handles trailing silence fine, and the
+                        // coarse RMS gate misclassifies quieter speech as silence —
+                        // trimming it dropped real words off the end of segments.
+                        // `speech_frames` is kept only for logging how much of the
+                        // segment the gate considered speech.
+                        let speech_frames = frames.saturating_sub(trailing_silence_frames);
+                        let seg_samples: usize = feed_lens[..frames].iter().sum();
+                        let speech_samples: usize = feed_lens[..speech_frames].iter().sum();
+                        let seg: Vec<f32> = seg_buf[..seg_samples].to_vec();
+                        seg_buf.drain(..seg_samples);
+                        feed_lens.drain(..frames);
+                        record_segment(&mut engine, &seg, speech_samples, seg_samples);
+                    }
+                }
+                StreamCmd::Finalize(reply) => {
+                    if segmenter.open_has_speech() {
+                        let tail = std::mem::take(&mut seg_buf);
+                        let n = tail.len();
+                        record_segment(&mut engine, &tail, n, n);
+                    }
+                    finalize_reply = Some(reply);
+                    break;
+                }
+                StreamCmd::Cancel => break,
+            }
+        }
+        // Release the mutable borrows of cursor/seg_meta/parts held by the closure.
+        drop(record_segment);
+
+        self.return_engine(engine, model_id);
+        let text = parts.join(" ");
+        if let Some(reply) = finalize_reply {
+            let _ = reply.send(if text.trim().is_empty() {
+                None
+            } else {
+                Some(text.clone())
+            });
+        }
+        info!(
+            "whisper pseudo-streaming worker finished ({} segments, {} ms)",
+            seg_meta.len(),
+            worker_t0.elapsed().as_millis()
+        );
+
+        // Write the streaming debug bundle after replying (doesn't delay paste).
+        if capture && !full_audio.is_empty() {
+            let meta = serde_json::json!({
+                "streaming": true,
+                "model": model_id,
+                "worker_ms": worker_t0.elapsed().as_millis() as u64,
+                "n_segments": seg_meta.len(),
+                "segments": seg_meta,
+                "final_text": text,
+                "settings": { "selected_model": model_id, "whisper_streaming": true },
+            });
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            if let Ok(app_data) = crate::portable::app_data_dir(&self.app_handle) {
+                let root = crate::debug_capture::debug_root(&app_data.join("recordings"));
+                if let Err(e) = crate::debug_capture::write_bundle(
+                    &root,
+                    ts,
+                    &full_audio,
+                    &meta,
+                    settings.debug_capture_limit,
+                ) {
+                    error!("streaming debug capture failed: {}", e);
+                }
+            }
+        }
+    }
+
     /// Return the leased engine to the mutex, unless the model was switched or
     /// unloaded during transcription (in which case the stale engine is dropped).
     fn return_engine(&self, engine: LoadedEngine, expected_model_id: &str) {
@@ -1101,7 +1413,133 @@ impl TranscriptionManager {
         .emit(&self.app_handle);
     }
 
+    /// Streaming worker for Gemini 3.5 Transcribe Live.
+    ///
+    /// Same contract as the native streaming worker — consume `Feed`, reply to
+    /// `Finalize` with the transcript (or `None` so `actions.rs` batch-falls
+    /// back) — but the decoding happens on Google's side over a WebSocket. The
+    /// leased `engine` is held purely to keep the single-engine invariant; the
+    /// cloud engine carries no model, so nothing is computed locally.
+    fn run_gemini_live_worker(
+        &self,
+        engine: LoadedEngine,
+        rx: mpsc::Receiver<StreamCmd>,
+        model_id: &str,
+    ) {
+        let settings = get_settings(&self.app_handle);
+        let api_key = crate::cloud::gemini::resolve_api_key(
+            settings
+                .cloud_api_keys
+                .get(crate::cloud::gemini::PROVIDER_ID)
+                .map(String::as_str)
+                .unwrap_or_default(),
+        );
+        let language =
+            effective_language_for_model(&settings, self.model_manager.as_ref(), model_id);
+
+        // Connecting costs ~700 ms, paid here — while the user is already
+        // speaking — so it never shows up in the post-release wait.
+        let mut session = match GeminiLiveSession::connect(
+            &api_key,
+            &settings.gemini_transcribe,
+            &language,
+            &settings.custom_words,
+        ) {
+            Ok(session) => session,
+            Err(e) => {
+                warn!(
+                    "Gemini Live: could not open a session ({}); falling back to batch transcription",
+                    e
+                );
+                self.return_engine(engine, model_id);
+                self.router.clear();
+                drain_until_finalize(rx);
+                return;
+            }
+        };
+
+        let mut finals: Vec<String> = Vec::new();
+        let mut tentative = String::new();
+        let mut failed = false;
+
+        // Drain whatever the socket has produced, updating the overlay's
+        // committed prefix (finalized chunks) and volatile suffix (the latest
+        // partial hypothesis).
+        let absorb = |events: Vec<LiveEvent>,
+                          finals: &mut Vec<String>,
+                          tentative: &mut String,
+                          failed: &mut bool| {
+            for event in events {
+                match event {
+                    LiveEvent::Interim(text) => *tentative = text,
+                    LiveEvent::Final(text) => {
+                        finals.push(text);
+                        tentative.clear();
+                    }
+                    LiveEvent::Closed(Err(e)) => {
+                        warn!("Gemini Live: session ended with an error: {}", e);
+                        *failed = true;
+                    }
+                    LiveEvent::Closed(Ok(())) => {}
+                }
+            }
+        };
+
+        loop {
+            match rx.recv() {
+                Ok(StreamCmd::Feed(pcm)) => {
+                    self.touch_activity();
+                    session.feed(&pcm);
+                    absorb(session.poll(), &mut finals, &mut tentative, &mut failed);
+                    self.emit_stream_text(&join_finals(&finals), &tentative);
+                }
+                Ok(StreamCmd::Finalize(reply)) => {
+                    self.emit_stream_working(StreamWorkKind::Transcribing);
+                    // Everything before the release is already transcribed; only
+                    // the tail is outstanding here (measured 220-500 ms).
+                    match session.finish(Duration::from_secs(20)) {
+                        Ok(tail) => finals.extend(tail),
+                        Err(e) => {
+                            warn!("Gemini Live: finalize failed: {}", e);
+                            failed = true;
+                        }
+                    }
+                    let text = join_finals(&finals);
+                    info!(
+                        "Gemini Live: {} chunk(s), {} chars{}",
+                        finals.len(),
+                        text.len(),
+                        if failed { " (session reported an error)" } else { "" }
+                    );
+                    // An empty result means the caller batch-transcribes the same
+                    // audio, so a dead socket costs latency, never the dictation.
+                    let _ = reply.send(stream_reply(text));
+                    break;
+                }
+                Ok(StreamCmd::Cancel) => {
+                    debug!("Gemini Live: cancelled");
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+
+        // Order matters: hand the engine back BEFORE touching the socket. The
+        // cloud engine holds no local resources, and keeping the lease across
+        // session teardown is precisely what stranded it in the first build —
+        // a hung teardown then took every later dictation down with it.
+        self.return_engine(engine, model_id);
+        self.router.clear();
+        drop(session);
+    }
+
     fn emit_stream_text(&self, committed: &str, tentative: &str) {
+        // Opt-out: some people only care about the finished text, and a
+        // rewriting live preview is a distraction. Purely cosmetic — the
+        // streaming backends keep running either way.
+        if !get_settings(&self.app_handle).show_live_transcript {
+            return;
+        }
         let _ = StreamTextEvent {
             committed: committed.to_string(),
             tentative: tentative.to_string(),
@@ -1182,6 +1620,11 @@ impl TranscriptionManager {
         // with INVALID_ARG, so the whisper extension must be gated on the
         // arch, not on the feature (see #1601).
         let mut model_is_whisper = false;
+        // Whether the model itself was handed the user's custom words. If it
+        // was, the fuzzy post-corrector must NOT also run: correcting text the
+        // model already got right is how a correct term gets replaced by a
+        // near-miss neighbour from the same list.
+        let mut custom_words_sent_to_model = false;
 
         // Perform transcription with the appropriate engine.
         // We use catch_unwind to prevent engine panics from poisoning the mutex,
@@ -1227,32 +1670,36 @@ impl TranscriptionManager {
                     model_languages
                 );
             }
+            // whisper takes them via `initial_prompt`; Gemini takes them as
+            // `custom_vocabulary` when that is switched on. Every other engine
+            // gets no biasing and so still relies on fuzzy post-correction.
+            custom_words_sent_to_model = match &engine {
+                LoadedEngine::TranscribeCpp(_) => model_is_whisper,
+                LoadedEngine::Gemini(_) => settings.gemini_transcribe.include_custom_words,
+                _ => false,
+            };
 
             let transcribe_result = catch_unwind(AssertUnwindSafe(|| -> Result<String> {
                 match &mut engine {
                     LoadedEngine::TranscribeCpp(session) => {
-                        // Custom words become the initial prompt ONLY for models
-                        // that accept one (whisper family). Attaching the
-                        // whisper run extension to a non-whisper arch is rejected
-                        // with INVALID_ARG, so skip it there and let the fuzzy
-                        // post-correction handle custom words instead.
-                        // For whisper-family models, transcribe each 30s window
-                        // "fresh" (condition_on_prev_tokens = false). whisper.cpp's
-                        // default conditions each window on the previous window's
-                        // decoded text; on long dictations that self-conditioning
-                        // collapses punctuation into an unbroken wall of text (and
-                        // can trigger repetition loops). Short clips are one window
-                        // so they were never affected.
+                        // whisper-family models get the style primer (+ any
+                        // custom words) as their initial_prompt; see
+                        // whisper_initial_prompt / WHISPER_STYLE_PRIMER. Non-whisper
+                        // archs reject the whisper run extension with INVALID_ARG,
+                        // so they get family = None and rely on fuzzy custom-word
+                        // post-correction instead.
+                        // We also transcribe each 30s window "fresh"
+                        // (condition_on_prev_tokens = false): whisper.cpp otherwise
+                        // conditions each window on the previous window's decoded
+                        // text, which on long dictations collapses punctuation into
+                        // an unbroken wall of text (and can trigger repetition
+                        // loops). The primer keeps steering style per window without
+                        // that error-propagation.
                         let family = if !model_is_whisper {
                             None
                         } else {
-                            let initial_prompt = if settings.custom_words.is_empty() {
-                                None
-                            } else {
-                                Some(settings.custom_words.join(", "))
-                            };
                             Some(RunExtension::Whisper(WhisperRunOptions {
-                                initial_prompt,
+                                initial_prompt: whisper_initial_prompt(&settings.custom_words),
                                 condition_on_prev_tokens: Some(false),
                                 ..Default::default()
                             }))
@@ -1360,6 +1807,12 @@ impl TranscriptionManager {
                             .map(|r| r.text)
                             .map_err(|e| anyhow::anyhow!("Cohere transcription failed: {}", e))
                     }
+                    LoadedEngine::Gemini(gemini_engine) => gemini_engine.transcribe(
+                        &audio,
+                        &settings.gemini_transcribe,
+                        &validated_language,
+                        &settings.custom_words,
+                    ),
                 }
             }));
 
@@ -1411,7 +1864,8 @@ impl TranscriptionManager {
         // family). We don't pass a prompt to non-whisper models (it requires the
         // whisper-kind run extension), so they still get fuzzy correction here,
         // same as the ONNX engines.
-        let filtered_result = post_process_transcription_text(result, &settings, model_is_whisper);
+        let filtered_result =
+            post_process_transcription_text(result, &settings, custom_words_sent_to_model);
 
         let et = std::time::Instant::now();
         let translation_note = if settings.translate_to_english {
@@ -1691,6 +2145,21 @@ fn cpp_translation_task(
 /// finalizes or cancels. Used when streaming can't actually run (model not
 /// loaded / not streaming-capable) so the finalize handshake still completes
 /// and the caller falls back to batch transcription.
+/// Turn a streaming worker's transcript into the `Finalize` reply.
+///
+/// `None` is the contract's "I produced nothing — batch-transcribe the same
+/// audio instead", so a dead socket costs latency rather than the dictation.
+/// Blank-but-non-empty text must map to `None` too: a whitespace-only string is
+/// still nothing, and returning `Some("  ")` would suppress the fallback and
+/// paste emptiness.
+fn stream_reply(text: String) -> Option<String> {
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
 fn drain_until_finalize(rx: mpsc::Receiver<StreamCmd>) {
     while let Ok(cmd) = rx.recv() {
         match cmd {
@@ -2034,6 +2503,22 @@ mod tests {
         });
 
         assert_eq!(result, raw);
+    }
+
+    #[test]
+    fn stream_reply_falls_back_on_nothing() {
+        // Every shape of "produced nothing" must hand control back to batch.
+        assert_eq!(stream_reply(String::new()), None);
+        assert_eq!(stream_reply("   ".to_string()), None);
+        assert_eq!(stream_reply("\n\t ".to_string()), None);
+    }
+
+    #[test]
+    fn stream_reply_keeps_real_text() {
+        assert_eq!(
+            stream_reply("Привет, deploy на staging.".to_string()),
+            Some("Привет, deploy на staging.".to_string())
+        );
     }
 
     #[test]

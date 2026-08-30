@@ -6,6 +6,7 @@ pub mod audio_toolkit;
 mod catalog;
 pub mod cli;
 mod clipboard;
+mod cloud;
 mod commands;
 mod debug_capture;
 mod helpers;
@@ -530,6 +531,114 @@ fn run_headless_transcription(app: &AppHandle, args: &CliArgs) -> i32 {
     let load_ms = load_start.elapsed().as_millis() as u64;
     let bound_backend = tm.current_backend();
 
+    // Streaming path: the same worker the microphone drives, fed from a file.
+    // Batch-only harnesses cannot reach the engine lease, the socket teardown or
+    // the batch fallback — which is exactly where the first Gemini Live build
+    // deadlocked — so this exists to make that path testable without a mic.
+    if args.stream {
+        // --repeat runs several dictations back-to-back *in one process*. That
+        // is the shape of the bug this harness was written for: the first
+        // streaming run stranded the engine lease, so run 1 looked fine and
+        // every run after it failed. A fresh process per run would never show it.
+        let stream_runs = args.repeat.unwrap_or(1).max(1);
+        let mut last: Option<(String, &str, u64, bool)> = None;
+        for run in 0..stream_runs {
+        let router = tm.stream_router();
+        tm.start_stream();
+
+        // 100 ms frames, the chunk size the recorder emits and the Live API wants.
+        const FRAME: usize = 1600;
+        const SAMPLE_RATE: f64 = 16_000.0;
+        let feed_start = Instant::now();
+        let mut fed_samples = 0usize;
+        for frame in samples.chunks(FRAME) {
+            router.feed(frame);
+            fed_samples += frame.len();
+            // Pace the feed to wall-clock, like the microphone does. Streaming
+            // backends are realtime protocols: dumping a whole dictation in a
+            // few milliseconds is not a faster version of the same test, it is a
+            // different one, and it does not reproduce what the recorder does.
+            let target = std::time::Duration::from_secs_f64(fed_samples as f64 / SAMPLE_RATE);
+            if let Some(wait) = target.checked_sub(feed_start.elapsed()) {
+                std::thread::sleep(wait);
+            }
+        }
+        // Hold the key a moment longer without speaking, like a person does.
+        let silence_frames =
+            (args.stream_trailing_silence_ms as f64 / 1000.0 * SAMPLE_RATE / FRAME as f64) as usize;
+        let silence = vec![0.0f32; FRAME];
+        for _ in 0..silence_frames {
+            router.feed(&silence);
+            fed_samples += FRAME;
+            let target = std::time::Duration::from_secs_f64(fed_samples as f64 / SAMPLE_RATE);
+            if let Some(wait) = target.checked_sub(feed_start.elapsed()) {
+                std::thread::sleep(wait);
+            }
+        }
+        let fed_ms = feed_start.elapsed().as_millis() as u64;
+        let _ = fed_ms;
+
+        let finalize_start = Instant::now();
+        let streamed = tm.finalize_stream();
+        let finalize_ms = finalize_start.elapsed().as_millis() as u64;
+
+        // The contract: an empty stream result means "batch-transcribe instead".
+        // Exercising it here is the point — a broken fallback is what turned a
+        // dead socket into a lost dictation.
+        let (text, source) = match streamed {
+            Ok(Some(t)) if !t.trim().is_empty() => (t, "stream"),
+            Ok(_) => match tm.transcribe(samples.clone()) {
+                Ok(t) => (t, "batch-fallback"),
+                Err(e) => {
+                    eprintln!("error: stream produced nothing and batch fallback failed: {}", e);
+                    return 1;
+                }
+            },
+            Err(e) => {
+                eprintln!("error: finalize_stream failed: {}", e);
+                return 1;
+            }
+        };
+
+        // A stranded engine lease is invisible in the transcript but breaks every
+        // later dictation, so assert it explicitly rather than eyeball the text.
+        let engine_returned = tm.is_model_loaded();
+        if stream_runs > 1 {
+            eprintln!(
+                "[stream {}/{}] source={} finalize={}ms engine_returned={} chars={}",
+                run + 1, stream_runs, source, finalize_ms, engine_returned, text.len()
+            );
+        }
+        last = Some((text, source, finalize_ms, engine_returned));
+        }
+
+        let (text, source, finalize_ms, engine_returned) =
+            last.expect("at least one streaming run");
+        if args.json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "model": model_id,
+                    "mode": "stream",
+                    "source": source,
+                    "audio_secs": audio_secs,
+                    "load_ms": load_ms,
+                    "runs": stream_runs,
+                    "finalize_ms": finalize_ms,
+                    "engine_returned": engine_returned,
+                    "text": text,
+                })
+            );
+        } else {
+            println!("{}", text);
+            eprintln!(
+                "[stream] source={} finalize={}ms engine_returned={}",
+                source, finalize_ms, engine_returned
+            );
+        }
+        return if engine_returned { 0 } else { 1 };
+    }
+
     let runs = args.repeat.unwrap_or(1).max(1);
     let mut times_ms: Vec<u64> = Vec::new();
     let mut text = String::new();
@@ -708,6 +817,9 @@ pub fn run(cli_args: CliArgs) {
             commands::history::retry_history_entry_transcription,
             commands::history::update_history_limit,
             commands::history::update_recording_retention_period,
+            commands::history::get_usage_daily,
+            commands::history::get_usage_monthly,
+            commands::history::get_usage_summary,
             helpers::clamshell::is_laptop,
         ])
         .events(collect_events![

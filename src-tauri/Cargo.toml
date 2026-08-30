@@ -69,6 +69,15 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 tar = "0.4.44"
 flate2 = "1.0"
 sha2 = "0.10"
+# Inline audio payloads for cloud transcription (see src/cloud/).
+base64 = "0.22"
+# WebSocket transport for cloud streaming transcription (Gemini Live).
+# rustls-native-roots reuses the rustls stack reqwest already links, so this
+# does not pull in a second TLS implementation.
+tokio-tungstenite = { version = "0.27", default-features = false, features = [
+  "connect",
+  "rustls-tls-native-roots",
+] }
 # Whisper-family models run through transcribe-cpp (GGUF/ggml, native backends);
 # transcribe-rs is now ONNX-only (Parakeet, Moonshine, SenseVoice, GigaAM,
 # Canary, Cohere). Per-platform backend features are added in the target tables.

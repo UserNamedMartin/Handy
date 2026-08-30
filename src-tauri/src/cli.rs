@@ -57,6 +57,21 @@ pub struct CliArgs {
     #[arg(long, value_name = "N")]
     pub repeat: Option<usize>,
 
+    /// Drive --transcribe-file through the *streaming* path instead of the batch
+    /// one: feed the WAV to the stream worker in real-time-sized frames, then
+    /// finalize, exactly as the recorder does. This is the only way to exercise
+    /// a streaming backend end-to-end without a microphone.
+    #[arg(long)]
+    pub stream: bool,
+
+    /// Feed this many ms of silence after the file before finalizing a --stream
+    /// run, emulating a pause before releasing the key. This is the case that
+    /// matters: a streaming backend may finalize everything *during* the pause,
+    /// leaving nothing to arrive after end-of-stream. Finalizing the instant the
+    /// audio ends never exercises it.
+    #[arg(long, value_name = "MS", default_value = "0")]
+    pub stream_trailing_silence_ms: u64,
+
     /// Emit --transcribe-file results as JSON.
     #[arg(long)]
     pub json: bool,

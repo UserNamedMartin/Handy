@@ -31,6 +31,14 @@ static MIGRATIONS: &[M] = &[
     M::up("ALTER TABLE transcription_history ADD COLUMN post_processed_text TEXT;"),
     M::up("ALTER TABLE transcription_history ADD COLUMN post_process_prompt TEXT;"),
     M::up("ALTER TABLE transcription_history ADD COLUMN post_process_requested BOOLEAN NOT NULL DEFAULT 0;"),
+    // Fork feature: per-dictation usage accounting, so the app can report how
+    // much you dictate and what the paid backends actually cost. Nullable
+    // throughout — entries written before this migration have no such data, and
+    // the aggregates must not pretend otherwise.
+    M::up("ALTER TABLE transcription_history ADD COLUMN duration_ms INTEGER;"),
+    M::up("ALTER TABLE transcription_history ADD COLUMN model_id TEXT;"),
+    M::up("ALTER TABLE transcription_history ADD COLUMN engine TEXT;"),
+    M::up("ALTER TABLE transcription_history ADD COLUMN cost_usd REAL;"),
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize, Type)]
@@ -50,6 +58,56 @@ pub enum HistoryUpdatePayload {
     Deleted { id: i64 },
     #[serde(rename = "toggled")]
     Toggled { id: i64 },
+}
+
+/// What one dictation consumed. Recorded alongside the transcript so the usage
+/// screen can answer "how much do I dictate" and "what did the paid backends
+/// cost" without re-deriving it from audio files that get pruned.
+#[derive(Clone, Debug, Default)]
+pub struct DictationUsage {
+    /// Length of the captured audio — what providers bill on.
+    pub duration_ms: Option<i64>,
+    /// Catalog id of the model that produced the transcript.
+    pub model_id: Option<String>,
+    /// "local" or "cloud". Cheap to group on and stable even if a model id is
+    /// later renamed or dropped from the catalog.
+    pub engine: Option<String>,
+    /// Our estimate in USD; `None` for local models, which cost nothing.
+    /// Derived from billed duration and the published rate — no provider
+    /// exposes a spend API, so this differs from an invoice by rounding.
+    pub cost_usd: Option<f64>,
+}
+
+/// One day or month of dictation activity.
+#[derive(Clone, Debug, Serialize, Deserialize, Type)]
+pub struct UsageBucket {
+    /// `YYYY-MM-DD` for daily buckets, `YYYY-MM` for monthly ones, in local time.
+    pub period: String,
+    pub dictations: i64,
+    pub seconds: f64,
+    pub cost_usd: f64,
+    /// How many dictations in this bucket actually carried a duration, so the UI
+    /// can mark a partially-recorded period rather than show a false dip.
+    pub measured: i64,
+}
+
+/// Lifetime totals plus a per-model split.
+#[derive(Clone, Debug, Serialize, Deserialize, Type)]
+pub struct UsageSummary {
+    pub dictations: i64,
+    pub seconds: f64,
+    pub cost_usd: f64,
+    pub measured: i64,
+    pub per_model: Vec<UsageByModel>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Type)]
+pub struct UsageByModel {
+    pub model_id: String,
+    pub engine: String,
+    pub dictations: i64,
+    pub seconds: f64,
+    pub cost_usd: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Type)]
@@ -210,6 +268,98 @@ impl HistoryManager {
         })
     }
 
+    /// Dictation activity per local-time day, oldest first, for the last
+    /// `days` days. Days with no dictations are simply absent — the UI fills
+    /// the gaps, so a quiet day is never confused with missing data.
+    pub fn usage_daily(&self, days: u32) -> Result<Vec<UsageBucket>> {
+        let since = Utc::now().timestamp() - (days as i64) * 86_400;
+        self.usage_buckets("date(timestamp, 'unixepoch', 'localtime')", Some(since))
+    }
+
+    /// Dictation activity per local-time month, oldest first. `months` bounds
+    /// the window loosely (31-day months) — the grouping itself is exact.
+    pub fn usage_monthly(&self, months: u32) -> Result<Vec<UsageBucket>> {
+        let since = Utc::now().timestamp() - (months as i64) * 31 * 86_400;
+        self.usage_buckets(
+            "strftime('%Y-%m', timestamp, 'unixepoch', 'localtime')",
+            Some(since),
+        )
+    }
+
+    fn usage_buckets(&self, period_expr: &str, since: Option<i64>) -> Result<Vec<UsageBucket>> {
+        let conn = self.get_connection()?;
+        // `period_expr` is a fixed literal chosen by the two callers above, never
+        // user input, so interpolating it into the SQL is safe.
+        let sql = format!(
+            "SELECT {period} AS period,
+                    COUNT(*) AS dictations,
+                    COALESCE(SUM(duration_ms), 0) / 1000.0 AS seconds,
+                    COALESCE(SUM(cost_usd), 0) AS cost_usd,
+                    SUM(CASE WHEN duration_ms IS NOT NULL THEN 1 ELSE 0 END) AS measured
+             FROM transcription_history
+             WHERE timestamp >= ?1
+             GROUP BY period
+             ORDER BY period ASC",
+            period = period_expr
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![since.unwrap_or(0)], |row| {
+            Ok(UsageBucket {
+                period: row.get("period")?,
+                dictations: row.get("dictations")?,
+                seconds: row.get("seconds")?,
+                cost_usd: row.get("cost_usd")?,
+                measured: row.get("measured")?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Lifetime totals and the per-model split.
+    pub fn usage_summary(&self) -> Result<UsageSummary> {
+        let conn = self.get_connection()?;
+        let (dictations, seconds, cost_usd, measured) = conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(duration_ms), 0) / 1000.0,
+                    COALESCE(SUM(cost_usd), 0),
+                    SUM(CASE WHEN duration_ms IS NOT NULL THEN 1 ELSE 0 END)
+             FROM transcription_history",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get::<_, Option<i64>>(3)?)),
+        )?;
+
+        let mut stmt = conn.prepare(
+            "SELECT COALESCE(model_id, 'unknown') AS model_id,
+                    COALESCE(engine, 'unknown') AS engine,
+                    COUNT(*) AS dictations,
+                    COALESCE(SUM(duration_ms), 0) / 1000.0 AS seconds,
+                    COALESCE(SUM(cost_usd), 0) AS cost_usd
+             FROM transcription_history
+             GROUP BY model_id, engine
+             ORDER BY seconds DESC",
+        )?;
+        let per_model = stmt
+            .query_map([], |row| {
+                Ok(UsageByModel {
+                    model_id: row.get("model_id")?,
+                    engine: row.get("engine")?,
+                    dictations: row.get("dictations")?,
+                    seconds: row.get("seconds")?,
+                    cost_usd: row.get("cost_usd")?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(UsageSummary {
+            dictations,
+            seconds,
+            cost_usd,
+            measured: measured.unwrap_or(0),
+            per_model,
+        })
+    }
+
     pub fn recordings_dir(&self) -> &std::path::Path {
         &self.recordings_dir
     }
@@ -223,6 +373,7 @@ impl HistoryManager {
         post_process_requested: bool,
         post_processed_text: Option<String>,
         post_process_prompt: Option<String>,
+        usage: DictationUsage,
     ) -> Result<HistoryEntry> {
         let timestamp = Utc::now().timestamp();
         let title = self.format_timestamp_title(timestamp);
@@ -237,8 +388,12 @@ impl HistoryManager {
                 transcription_text,
                 post_processed_text,
                 post_process_prompt,
-                post_process_requested
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                post_process_requested,
+                duration_ms,
+                model_id,
+                engine,
+                cost_usd
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 &file_name,
                 timestamp,
@@ -248,6 +403,10 @@ impl HistoryManager {
                 &post_processed_text,
                 &post_process_prompt,
                 post_process_requested,
+                usage.duration_ms,
+                &usage.model_id,
+                &usage.engine,
+                usage.cost_usd,
             ],
         )?;
 

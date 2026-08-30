@@ -371,6 +371,67 @@ impl std::ops::DerefMut for SecretMap {
     }
 }
 
+/// Which transcription mode Gemini 3.5 Transcribe runs in.
+///
+/// This is the model's own knob and has no equivalent in any local engine,
+/// which is why it lives in a per-model settings block rather than alongside
+/// Handy's global options.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Type, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GeminiTranscribeMode {
+    /// Dictation-grade output: filler words removed, self-corrections resolved
+    /// ("at one — no, make it two" -> "at two"), formatting applied. Google
+    /// notes it "might slightly rewrite, omit, or rephrase" what was said, and
+    /// it cannot be combined with diarization or word timestamps.
+    #[default]
+    Smart,
+    /// Exactly what was said, stutters and fillers intact. Required if you want
+    /// speaker labels or word timestamps.
+    Verbatim,
+}
+
+/// Settings that belong to the Gemini cloud model specifically.
+///
+/// Kept as its own struct (rather than more flat `AppSettings` fields) so the
+/// settings UI can show one block that appears only while that model is
+/// selected, and so a second cloud provider can be added beside it later
+/// without the top level growing a field per provider per knob.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Type)]
+#[serde(default)]
+pub struct GeminiTranscribeSettings {
+    pub mode: GeminiTranscribeMode,
+    /// BCP-47 hints, e.g. `["ru-RU", "en-US"]`. Empty means auto-detect across
+    /// all 85+ locales. Naming both languages of a code-switched dictation is
+    /// the documented way to steer mixed speech, so this is the knob that
+    /// matters most for Russian-with-English-terms.
+    pub language_codes: Vec<String>,
+    /// Acoustic biasing terms (API cap 1000; Google recommends around 100).
+    /// Distinct from `custom_words`, which drives whisper's initial prompt and
+    /// the fuzzy post-corrector — this list is fed to the model itself.
+    pub custom_vocabulary: Vec<String>,
+    /// Also send Handy's global `custom_words` as biasing terms, so the one
+    /// list already maintained for whisper carries over.
+    pub include_custom_words: bool,
+    /// Label speakers in the output. Forces `Verbatim`.
+    pub diarization: bool,
+    /// Emit word-level timestamps. Forces `Verbatim`, and Google warns it
+    /// "degrades transcription accuracy".
+    pub timestamps: bool,
+}
+
+impl Default for GeminiTranscribeSettings {
+    fn default() -> Self {
+        Self {
+            mode: GeminiTranscribeMode::Smart,
+            language_codes: Vec::new(),
+            custom_vocabulary: Vec::new(),
+            include_custom_words: true,
+            diarization: false,
+            timestamps: false,
+        }
+    }
+}
+
 /* still handy for composing the initial JSON in the store ------------- */
 /// The container-level `serde(default)` (backed by the `Default` impl below)
 /// guarantees every field — including ones added in the future — falls back to
@@ -501,6 +562,15 @@ pub struct AppSettings {
     pub extra_recording_buffer_ms: u64,
     #[serde(default = "default_vad_enabled")]
     pub vad_enabled: bool,
+    /// Fork feature: whisper "pseudo-streaming". While recording a long
+    /// dictation, close completed clauses at silence pauses and transcribe them
+    /// in the background, so at key-release only the final segment is left —
+    /// turning a multi-second wait into ~1 s on long clips, with no measured
+    /// quality loss (see FORK_NOTES / handy-eval). Whisper-family models only;
+    /// short clips fall through as a single segment (≈ batch). Off by default —
+    /// it changes the live audio path and wants a real-mic shake-out first.
+    #[serde(default = "default_whisper_streaming")]
+    pub whisper_streaming: bool,
     /// Fork feature: write a rich debug bundle (raw audio + gain/VAD/timing
     /// metadata) per dictation for later offline analysis. On by default.
     #[serde(default = "default_debug_capture")]
@@ -508,6 +578,22 @@ pub struct AppSettings {
     /// How many debug bundles to keep before pruning the oldest.
     #[serde(default = "default_debug_capture_limit")]
     pub debug_capture_limit: usize,
+    /// Fork feature: show the live, still-changing transcript in the recording
+    /// overlay while you speak. Off means the overlay stays a plain recording
+    /// indicator and only the finished text is inserted — the streaming backend
+    /// is unaffected either way, this is purely what the widget displays.
+    #[serde(default = "default_show_live_transcript")]
+    pub show_live_transcript: bool,
+    /// Fork feature: API keys for cloud transcription backends, keyed by
+    /// provider id ("gemini"). Deliberately separate from
+    /// `post_process_api_keys` — post-processing and transcription are
+    /// different grants of access to your dictation.
+    #[serde(default = "default_cloud_api_keys")]
+    pub cloud_api_keys: SecretMap,
+    /// Fork feature: per-model settings for Gemini 3.5 Transcribe. Only read
+    /// when that model is the selected one.
+    #[serde(default)]
+    pub gemini_transcribe: GeminiTranscribeSettings,
     /// Which recording overlay to show: None / Minimal / Live. Streaming mode is
     /// not gated on this — that follows model capability. Migrated from the old
     /// `overlay_position` (position `none` → style `None`).
@@ -574,6 +660,22 @@ fn default_overlay_style() -> OverlayStyle {
     return OverlayStyle::None;
     #[cfg(not(target_os = "linux"))]
     return OverlayStyle::Live;
+}
+
+fn default_whisper_streaming() -> bool {
+    false
+}
+
+/// Cloud providers start with an empty key: a cloud model is unusable — and so
+/// cannot silently send anything anywhere — until the user pastes one in.
+fn default_show_live_transcript() -> bool {
+    true
+}
+
+fn default_cloud_api_keys() -> SecretMap {
+    let mut map = HashMap::new();
+    map.insert(crate::cloud::gemini::PROVIDER_ID.to_string(), String::new());
+    SecretMap(map)
 }
 
 fn default_vad_enabled() -> bool {
@@ -998,8 +1100,12 @@ pub fn get_default_settings() -> AppSettings {
         transcribe_gpu_device: default_transcribe_gpu_device(),
         extra_recording_buffer_ms: 0,
         vad_enabled: default_vad_enabled(),
+        whisper_streaming: default_whisper_streaming(),
         debug_capture: default_debug_capture(),
         debug_capture_limit: default_debug_capture_limit(),
+        show_live_transcript: default_show_live_transcript(),
+        cloud_api_keys: default_cloud_api_keys(),
+        gemini_transcribe: GeminiTranscribeSettings::default(),
         overlay_style: default_overlay_style(),
     }
 }

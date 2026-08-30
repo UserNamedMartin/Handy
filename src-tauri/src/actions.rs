@@ -101,6 +101,36 @@ fn should_use_streaming_overlay(style: OverlayStyle, is_streaming: bool) -> bool
     style == OverlayStyle::Live && is_streaming
 }
 
+/// Build the usage record for one dictation.
+///
+/// `sample_count` is 16 kHz mono PCM, which is what every engine is handed and
+/// what providers bill on. `billed` is false when the transcription failed —
+/// the duration is still worth keeping for the "how much do I dictate" stats,
+/// but attaching a cost to a request that produced nothing would inflate the
+/// spend report.
+fn dictation_usage(
+    tm: &crate::managers::transcription::TranscriptionManager,
+    sample_count: usize,
+    billed: bool,
+) -> crate::managers::history::DictationUsage {
+    const SAMPLE_RATE: f64 = 16_000.0;
+    let seconds = sample_count as f64 / SAMPLE_RATE;
+    let model_id = tm.get_current_model();
+
+    let cost_usd = match (&model_id, billed) {
+        (Some(id), true) => crate::cloud::estimate_cost_usd(id, seconds),
+        _ => None,
+    };
+    let engine = model_id.as_deref().map(crate::cloud::engine_kind).map(str::to_string);
+
+    crate::managers::history::DictationUsage {
+        duration_ms: Some((seconds * 1000.0).round() as i64),
+        model_id,
+        engine,
+        cost_usd,
+    }
+}
+
 async fn post_process_transcription(settings: &AppSettings, transcription: &str) -> Option<String> {
     if is_blank_transcription(transcription) {
         debug!("Post-processing skipped because the transcription is empty");
@@ -501,14 +531,29 @@ impl ShortcutAction for TranscribeAction {
             .as_ref()
             .map(|m| m.supports_streaming)
             .unwrap_or(false);
-        let vad_policy = if !settings.vad_enabled {
+        // Cloud models get the microphone untouched. Handy's VAD exists to spare
+        // local engines audio they handle badly; Google's guidance for the Live
+        // API is the opposite — send raw 16-bit PCM and let the service decide —
+        // and their own client gates nothing either. Keeping our gate here cost
+        // real transcripts: measured against the fork's whisper corpus it passed
+        // 98% of frames at normal volume but only 15-22% of a faint whisper,
+        // because the auto-gain that compensates for it is offline-path only.
+        // Gemini transcribes that same faint whisper perfectly when it is
+        // actually given it.
+        let cloud_model = crate::cloud::engine_kind(&settings.selected_model) == "cloud";
+        let vad_policy = if !settings.vad_enabled || cloud_model {
             VadPolicy::Disabled
         } else if model_supports_streaming {
             VadPolicy::Streaming
         } else {
             VadPolicy::Offline
         };
-        if model_supports_streaming {
+        // Native streaming models always stream; whisper-family models stream
+        // only when the fork's `whisper_streaming` pseudo-streaming is enabled
+        // (the worker segments + background-transcribes; see run_whisper_segment_worker).
+        // VadPolicy/overlay stay driven by model_supports_streaming — whisper keeps
+        // the compact pill and its Offline capture path (which also feeds the router).
+        if model_supports_streaming || settings.whisper_streaming {
             tm.start_stream();
         }
         let plan_elapsed = plan_started.elapsed();
@@ -838,6 +883,7 @@ impl ShortcutAction for TranscribeAction {
                                     post_process,
                                     processed.post_processed_text.clone(),
                                     processed.post_process_prompt.clone(),
+                                    dictation_usage(&tm, sample_count, true),
                                 ) {
                                     error!("Failed to save history entry: {}", err);
                                 }
@@ -901,6 +947,10 @@ impl ShortcutAction for TranscribeAction {
                                     post_process,
                                     None,
                                     None,
+                                    // Billed = false: the transcription failed, so
+                                    // the duration is still worth recording but a
+                                    // cost would be invented.
+                                    dictation_usage(&tm, sample_count, false),
                                 ) {
                                     error!("Failed to save failed history entry: {}", save_err);
                                 }

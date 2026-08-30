@@ -846,6 +846,39 @@ async updateRecordingRetentionPeriod(period: string) : Promise<Result<null, stri
 }
 },
 /**
+ * Dictation activity per local-time day for the usage screen.
+ */
+async getUsageDaily(days: number | null) : Promise<Result<UsageBucket[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_usage_daily", { days }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Dictation activity per local-time month — the spend retrospective.
+ */
+async getUsageMonthly(months: number | null) : Promise<Result<UsageBucket[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_usage_monthly", { months }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Lifetime totals plus the per-model split.
+ */
+async getUsageSummary() : Promise<Result<UsageSummary, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_usage_summary") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Checks if the Mac is a laptop by detecting battery presence
  * 
  * This uses pmset to check for battery information.
@@ -881,6 +914,22 @@ streamTextEvent: "stream-text-event"
 /** user-defined types **/
 
 /**
+ * How an individual transcribe binding chooses between hold-to-talk and
+ * toggle behaviour, independent of the app-wide `push_to_talk` setting.
+ * 
+ * - `Global` follows the app-wide `push_to_talk` setting (backward-compatible
+ * default, so existing bindings keep behaving exactly as before).
+ * - `PushToTalk` always records while the key is held and stops on release.
+ * - `Toggle` starts recording on the first press and stops on the next press
+ * (hands-free — no need to keep holding the key).
+ */
+export type ActivationMode = "global" | "push_to_talk" | "toggle" | 
+/**
+ * Hold to talk, OR double-tap to lock hands-free recording (tap once more
+ * to stop) — the "Wispr Flow"-style behaviour, all on a single key.
+ */
+"hybrid"
+/**
  * The container-level `serde(default)` (backed by the `Default` impl below)
  * guarantees every field — including ones added in the future — falls back to
  * its `get_default_settings()` value when missing from a stored settings
@@ -907,6 +956,44 @@ bindings?: Partial<{ [key in string]: ShortcutBinding }>; push_to_talk?: boolean
  */
 whats_new_last_seen_version?: string; selected_model?: string; onboarding_completed?: boolean; always_on_microphone?: boolean; selected_microphone?: string | null; clamshell_microphone?: string | null; selected_output_device?: string | null; translate_to_english?: boolean; selected_language?: string; overlay_position?: OverlayPosition; debug_mode?: boolean; log_level?: LogLevel; custom_words?: string[]; model_unload_timeout?: ModelUnloadTimeout; word_correction_threshold?: number; history_limit?: number; recording_retention_period?: RecordingRetentionPeriod; paste_method?: PasteMethod; clipboard_handling?: ClipboardHandling; auto_submit?: boolean; auto_submit_key?: AutoSubmitKey; post_process_enabled?: boolean; post_process_provider_id?: string; post_process_providers?: PostProcessProvider[]; post_process_api_keys?: SecretMap; post_process_models?: Partial<{ [key in string]: string }>; post_process_prompts?: LLMPrompt[]; post_process_selected_prompt_id?: string | null; mute_while_recording?: boolean; append_trailing_space?: boolean; app_language?: string; theme?: Theme; experimental_enabled?: boolean; lazy_stream_close?: boolean; keyboard_implementation?: KeyboardImplementation; show_tray_icon?: boolean; paste_delay_ms?: number; paste_delay_after_ms?: number; typing_tool?: TypingTool; external_script_path?: string | null; custom_filler_words?: string[] | null; transcribe_accelerator?: TranscribeAcceleratorSetting; ort_accelerator?: OrtAcceleratorSetting; transcribe_gpu_device?: number; extra_recording_buffer_ms?: number; vad_enabled?: boolean; 
 /**
+ * Fork feature: whisper "pseudo-streaming". While recording a long
+ * dictation, close completed clauses at silence pauses and transcribe them
+ * in the background, so at key-release only the final segment is left —
+ * turning a multi-second wait into ~1 s on long clips, with no measured
+ * quality loss (see FORK_NOTES / handy-eval). Whisper-family models only;
+ * short clips fall through as a single segment (≈ batch). Off by default —
+ * it changes the live audio path and wants a real-mic shake-out first.
+ */
+whisper_streaming?: boolean; 
+/**
+ * Fork feature: write a rich debug bundle (raw audio + gain/VAD/timing
+ * metadata) per dictation for later offline analysis. On by default.
+ */
+debug_capture?: boolean; 
+/**
+ * How many debug bundles to keep before pruning the oldest.
+ */
+debug_capture_limit?: number; 
+/**
+ * Fork feature: show the live, still-changing transcript in the recording
+ * overlay while you speak. Off means the overlay stays a plain recording
+ * indicator and only the finished text is inserted — the streaming backend
+ * is unaffected either way, this is purely what the widget displays.
+ */
+show_live_transcript?: boolean; 
+/**
+ * Fork feature: API keys for cloud transcription backends, keyed by
+ * provider id ("gemini"). Deliberately separate from
+ * `post_process_api_keys` — post-processing and transcription are
+ * different grants of access to your dictation.
+ */
+cloud_api_keys?: SecretMap; 
+/**
+ * Fork feature: per-model settings for Gemini 3.5 Transcribe. Only read
+ * when that model is the selected one.
+ */
+gemini_transcribe?: GeminiTranscribeSettings; 
+/**
  * Which recording overlay to show: None / Minimal / Live. Streaming mode is
  * not gated on this — that follows model capability. Migrated from the old
  * `overlay_position` (position `none` → style `None`).
@@ -924,7 +1011,69 @@ export type EngineType =
  * Voxtral, Qwen3-ASR, Nemotron, …). The architecture is auto-detected from
  * the file, so this one variant covers the whole transcribe-cpp family.
  */
-"TranscribeCpp" | "Parakeet" | "Moonshine" | "MoonshineStreaming" | "SenseVoice" | "GigaAM" | "Canary" | "Cohere"
+"TranscribeCpp" | "Parakeet" | "Moonshine" | "MoonshineStreaming" | "SenseVoice" | "GigaAM" | "Canary" | "Cohere" | 
+/**
+ * Google Gemini 3.5 Transcribe, over the network. The only non-local
+ * engine: nothing is downloaded and nothing runs on this machine — see
+ * [`crate::cloud::gemini`].
+ */
+"Gemini"
+/**
+ * Which transcription mode Gemini 3.5 Transcribe runs in.
+ * 
+ * This is the model's own knob and has no equivalent in any local engine,
+ * which is why it lives in a per-model settings block rather than alongside
+ * Handy's global options.
+ */
+export type GeminiTranscribeMode = 
+/**
+ * Dictation-grade output: filler words removed, self-corrections resolved
+ * ("at one — no, make it two" -> "at two"), formatting applied. Google
+ * notes it "might slightly rewrite, omit, or rephrase" what was said, and
+ * it cannot be combined with diarization or word timestamps.
+ */
+"smart" | 
+/**
+ * Exactly what was said, stutters and fillers intact. Required if you want
+ * speaker labels or word timestamps.
+ */
+"verbatim"
+/**
+ * Settings that belong to the Gemini cloud model specifically.
+ * 
+ * Kept as its own struct (rather than more flat `AppSettings` fields) so the
+ * settings UI can show one block that appears only while that model is
+ * selected, and so a second cloud provider can be added beside it later
+ * without the top level growing a field per provider per knob.
+ */
+export type GeminiTranscribeSettings = { mode: GeminiTranscribeMode; 
+/**
+ * BCP-47 hints, e.g. `["ru-RU", "en-US"]`. Empty means auto-detect across
+ * all 85+ locales. Naming both languages of a code-switched dictation is
+ * the documented way to steer mixed speech, so this is the knob that
+ * matters most for Russian-with-English-terms.
+ */
+language_codes: string[]; 
+/**
+ * Acoustic biasing terms (API cap 1000; Google recommends around 100).
+ * Distinct from `custom_words`, which drives whisper's initial prompt and
+ * the fuzzy post-corrector — this list is fed to the model itself.
+ */
+custom_vocabulary: string[]; 
+/**
+ * Also send Handy's global `custom_words` as biasing terms, so the one
+ * list already maintained for whisper carries over.
+ */
+include_custom_words: boolean; 
+/**
+ * Label speakers in the output. Forces `Verbatim`.
+ */
+diarization: boolean; 
+/**
+ * Emit word-level timestamps. Forces `Verbatim`, and Google warns it
+ * "degrades transcription accuracy".
+ */
+timestamps: boolean }
 export type GpuDeviceOption = { id: number; name: string; total_vram_mb: number }
 export type HistoryEntry = { id: number; file_name: string; timestamp: number; saved: boolean; title: string; transcription_text: string; post_processed_text: string | null; post_process_prompt: string | null; post_process_requested: boolean }
 export type HistoryUpdatePayload = { action: "added"; entry: HistoryEntry } | { action: "updated"; entry: HistoryEntry } | { action: "deleted"; id: number } | { action: "toggled"; id: number }
@@ -964,7 +1113,13 @@ sha256: string | null } } |
  * Already present on disk — a user-provided custom model, or one discovered
  * in a shared cache. Nothing to download.
  */
-"Local"
+"Local" | 
+/**
+ * Runs on a provider's servers. There is no file: it is always "available"
+ * (subject to an API key), can never be downloaded, and can never be
+ * deleted. `provider` keys into [`crate::settings::AppSettings::cloud_api_keys`].
+ */
+{ Cloud: { provider: string } }
 export type ModelUnloadTimeout = "never" | "immediately" | "min_2" | "min_5" | "min_10" | "min_15" | "hour_1" | "sec_15"
 export type OrtAcceleratorSetting = "auto" | "cpu" | "cuda" | "directml" | "rocm"
 export type OverlayPosition = "top" | "bottom"
@@ -981,7 +1136,12 @@ export type PermissionAccess = "allowed" | "denied" | "unknown"
 export type PostProcessProvider = { id: string; label: string; base_url: string; allow_base_url_edit?: boolean; models_endpoint?: string | null; supports_structured_output?: boolean }
 export type RecordingRetentionPeriod = "never" | "preserve_limit" | "days_3" | "weeks_2" | "months_3"
 export type SecretMap = Partial<{ [key in string]: string }>
-export type ShortcutBinding = { id: string; name: string; description: string; default_binding: string; current_binding: string }
+export type ShortcutBinding = { id: string; name: string; description: string; default_binding: string; current_binding: string; 
+/**
+ * Per-binding activation mode. Defaults to `Global` so stores written by
+ * older versions (which lack this field) keep the previous behaviour.
+ */
+activation_mode?: ActivationMode }
 export type SoundTheme = "marimba" | "pop" | "custom"
 /**
  * Phase of the streaming overlay card, emitted to drive its UI state.
@@ -1022,6 +1182,24 @@ export type StreamWorkKind = "transcribing" | "polishing"
 export type Theme = "system" | "light" | "dark"
 export type TranscribeAcceleratorSetting = "auto" | "cpu" | "gpu"
 export type TypingTool = "auto" | "wtype" | "kwtype" | "dotool" | "ydotool" | "xdotool"
+/**
+ * One day or month of dictation activity.
+ */
+export type UsageBucket = { 
+/**
+ * `YYYY-MM-DD` for daily buckets, `YYYY-MM` for monthly ones, in local time.
+ */
+period: string; dictations: number; seconds: number; cost_usd: number; 
+/**
+ * How many dictations in this bucket actually carried a duration, so the UI
+ * can mark a partially-recorded period rather than show a false dip.
+ */
+measured: number }
+export type UsageByModel = { model_id: string; engine: string; dictations: number; seconds: number; cost_usd: number }
+/**
+ * Lifetime totals plus a per-model split.
+ */
+export type UsageSummary = { dictations: number; seconds: number; cost_usd: number; measured: number; per_model: UsageByModel[] }
 export type WindowsMicrophonePermissionStatus = { supported: boolean; overall_access: PermissionAccess; device_access: PermissionAccess; app_access: PermissionAccess; desktop_app_access: PermissionAccess }
 
 /** tauri-specta globals **/

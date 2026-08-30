@@ -1,6 +1,6 @@
 use crate::actions::process_transcription_output;
 use crate::managers::{
-    history::{HistoryManager, PaginatedHistory},
+    history::{HistoryManager, PaginatedHistory, UsageBucket, UsageSummary},
     transcription::TranscriptionManager,
 };
 use std::sync::Arc;
@@ -151,4 +151,37 @@ pub async fn update_recording_retention_period(
         .map_err(|e| e.to_string())?;
 
     Ok(())
+}
+
+/// Dictation activity per local-time day for the usage screen.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_usage_daily(
+    history_manager: State<'_, Arc<HistoryManager>>,
+    days: Option<u32>,
+) -> Result<Vec<UsageBucket>, String> {
+    history_manager
+        .usage_daily(days.unwrap_or(90))
+        .map_err(|e| e.to_string())
+}
+
+/// Dictation activity per local-time month — the spend retrospective.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_usage_monthly(
+    history_manager: State<'_, Arc<HistoryManager>>,
+    months: Option<u32>,
+) -> Result<Vec<UsageBucket>, String> {
+    history_manager
+        .usage_monthly(months.unwrap_or(12))
+        .map_err(|e| e.to_string())
+}
+
+/// Lifetime totals plus the per-model split.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_usage_summary(
+    history_manager: State<'_, Arc<HistoryManager>>,
+) -> Result<UsageSummary, String> {
+    history_manager.usage_summary().map_err(|e| e.to_string())
 }

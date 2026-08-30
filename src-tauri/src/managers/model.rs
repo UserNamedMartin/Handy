@@ -35,6 +35,10 @@ pub enum EngineType {
     GigaAM,
     Canary,
     Cohere,
+    /// Google Gemini 3.5 Transcribe, over the network. The only non-local
+    /// engine: nothing is downloaded and nothing runs on this machine — see
+    /// [`crate::cloud::gemini`].
+    Gemini,
 }
 
 /// Where a model comes from and how Handy obtains it — the routing discriminant
@@ -54,6 +58,10 @@ pub enum ModelSource {
     /// Already present on disk — a user-provided custom model, or one discovered
     /// in a shared cache. Nothing to download.
     Local,
+    /// Runs on a provider's servers. There is no file: it is always "available"
+    /// (subject to an API key), can never be downloaded, and can never be
+    /// deleted. `provider` keys into [`crate::settings::AppSettings::cloud_api_keys`].
+    Cloud { provider: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -1046,6 +1054,93 @@ impl ModelManager {
             },
         );
 
+        // ---- Cloud models -------------------------------------------------
+        // Not downloaded, not local, and shown in their own category in the
+        // model list. Selecting one routes dictation off this machine, so it is
+        // never recommended by default and never auto-selected.
+        let gemini_languages: Vec<String> = vec![
+            "af", "am", "ar", "az", "be", "bg", "bn", "bs", "ca", "cs", "cy", "da", "de", "el",
+            "en", "es", "et", "eu", "fa", "fi", "fil", "fr", "ga", "gl", "gu", "ha", "he", "hi",
+            "hr", "hu", "hy", "id", "is", "it", "ja", "jv", "ka", "kk", "km", "kn", "ko", "lo",
+            "lt", "lv", "mk", "ml", "mn", "mr", "ms", "my", "ne", "nl", "no", "pa", "pl", "ps",
+            "pt", "ro", "ru", "si", "sk", "sl", "so", "sq", "sr", "su", "sv", "sw", "ta", "te",
+            "th", "tr", "uk", "ur", "uz", "vi", "zh", "zu",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        available_models.insert(
+            crate::cloud::gemini::MODEL_ID.to_string(),
+            ModelInfo {
+                id: crate::cloud::gemini::MODEL_ID.to_string(),
+                name: "Gemini 3.5 Transcribe".to_string(),
+                description:
+                    "Google's cloud speech-to-text. Detects 85+ languages on its own and handles \
+                     mixed-language speech. Needs an API key, an internet connection, and sends \
+                     your audio to Google."
+                        .to_string(),
+                filename: crate::cloud::gemini::MODEL_ID.to_string(),
+                source: ModelSource::Cloud {
+                    provider: crate::cloud::gemini::PROVIDER_ID.to_string(),
+                },
+                size_mb: 0,
+                // Always "available": there is nothing to fetch. Reasserted on
+                // every refresh by `update_download_status`.
+                is_downloaded: true,
+                is_downloading: false,
+                partial_size: 0,
+                is_directory: false,
+                engine_type: EngineType::Gemini,
+                accuracy_score: 0.95,
+                speed_score: 0.85,
+                supports_translation: false,
+                is_recommended: false,
+                supported_languages: gemini_languages.clone(),
+                supports_language_selection: true,
+                is_custom: false,
+                // Handy's streaming preview is for local engines that decode
+                // incrementally. Gemini's streaming variant is a separate model
+                // and scores *worse* than this batch one, so it is not offered.
+                supports_streaming: false,
+                supports_language_detection: true,
+            },
+        );
+
+        available_models.insert(
+            crate::cloud::gemini_live::LIVE_MODEL_ID.to_string(),
+            ModelInfo {
+                id: crate::cloud::gemini_live::LIVE_MODEL_ID.to_string(),
+                name: "Gemini 3.5 Transcribe Live".to_string(),
+                description:
+                    "Streaming version: transcribes while you speak, so releasing the key leaves \
+                     only a fraction of a second of wait. Slightly less accurate than the batch \
+                     model. Needs an API key and an internet connection."
+                        .to_string(),
+                filename: crate::cloud::gemini_live::LIVE_MODEL_ID.to_string(),
+                source: ModelSource::Cloud {
+                    provider: crate::cloud::gemini::PROVIDER_ID.to_string(),
+                },
+                size_mb: 0,
+                is_downloaded: true,
+                is_downloading: false,
+                partial_size: 0,
+                is_directory: false,
+                engine_type: EngineType::Gemini,
+                // Google's own numbers put the streaming variant behind the batch
+                // one (4.0% vs 2.6% AA-WER), which is the trade for the latency.
+                accuracy_score: 0.92,
+                speed_score: 0.99,
+                supports_translation: false,
+                is_recommended: false,
+                supported_languages: gemini_languages.clone(),
+                supports_language_selection: true,
+                is_custom: false,
+                supports_streaming: true,
+                supports_language_detection: true,
+            },
+        );
+
         // Seed the bundled offline catalog before the on-disk scans, so a model
         // already in the HF cache dedups onto its richer catalog entry (the scans
         // only insert ids not already present) instead of showing as a bare cache
@@ -1306,6 +1401,15 @@ impl ModelManager {
         let mut models = self.available_models.lock().unwrap();
 
         for model in models.values_mut() {
+            if matches!(model.source, ModelSource::Cloud { .. }) {
+                // Nothing on disk to inspect — a cloud model is present as soon
+                // as it is in the catalog. Whether it is *usable* is a question
+                // about the API key, which the engine answers at load time.
+                model.is_downloaded = true;
+                model.is_downloading = false;
+                model.partial_size = 0;
+                continue;
+            }
             if let ModelSource::HuggingFace { repo_id, revision } = &model.source {
                 model.is_downloaded = hf_cached_path(repo_id, revision, &model.filename).is_some();
                 model.is_downloading = false;
@@ -1845,6 +1949,11 @@ impl ModelManager {
             ModelSource::Local => {
                 return Err(anyhow::anyhow!("No download source for model"));
             }
+            ModelSource::Cloud { .. } => {
+                return Err(anyhow::anyhow!(
+                    "Cloud models run on the provider's servers and are not downloaded"
+                ));
+            }
         };
         let model_path = self.models_dir.join(&model_info.filename);
         let partial_path = self
@@ -2187,6 +2296,12 @@ impl ModelManager {
 
         debug!("ModelManager: Found model info: {:?}", model_info);
 
+        if matches!(model_info.source, ModelSource::Cloud { .. }) {
+            return Err(anyhow::anyhow!(
+                "Cloud models cannot be deleted; remove the API key instead"
+            ));
+        }
+
         if let ModelSource::HuggingFace { repo_id, revision } = &model_info.source {
             // Cached at <cache>/models--org--name/snapshots/<rev>/<file>; remove
             // the whole repo dir (blobs + refs + snapshots). Per product decision,
@@ -2283,6 +2398,14 @@ impl ModelManager {
         if model_info.is_downloading {
             return Err(anyhow::anyhow!(
                 "Model is currently downloading: {}",
+                model_id
+            ));
+        }
+
+        if matches!(model_info.source, ModelSource::Cloud { .. }) {
+            return Err(anyhow::anyhow!(
+                "Cloud model has no local path: {}. This is a bug — the load path \
+                 must not resolve a path for cloud engines.",
                 model_id
             ));
         }
