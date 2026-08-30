@@ -15,7 +15,8 @@
     "postProcessing": "Post Process",
     "history": "History",
     "debug": "Debug",
-    "about": "About"
+    "about": "About",
+    "usage": "Usage"
   },
   "onboarding": {
     "subtitle": "To get started, choose a transcription model",
@@ -196,6 +197,10 @@
       "pushToTalk": {
         "label": "Push To Talk",
         "description": "Hold to record, release to stop"
+      },
+      "showLiveTranscript": {
+        "label": "Live transcript in overlay",
+        "description": "Show the transcript forming in the recording widget while you speak. Display only — turning it off does not slow transcription down."
       }
     },
     "models": {
@@ -214,7 +219,28 @@
         "label": "Rescan",
         "tooltip": "Rescan for models added to the models folder or Hugging Face cache outside Handy"
       },
-      "noModelsMatch": "No models match this filter."
+      "noModelsMatch": "No models match this filter.",
+      "cloud": {
+        "apiKey": "API key",
+        "apiKeyHint": "From Google AI Studio. Stored locally and never committed; audio is sent to Google while this model is selected.",
+        "mode": "Mode",
+        "mode_smart": "Smart",
+        "mode_verbatim": "Verbatim",
+        "modeSmartHint": "Removes fillers and resolves self-corrections. It may also lightly rephrase what you said.",
+        "modeVerbatimHint": "Exactly what was said, stutters and fillers included.",
+        "languages": "Language hints",
+        "languagesHint": "Comma-separated BCP-47 codes, e.g. ru-RU, en-US. Leave empty to auto-detect across 85+ languages.",
+        "languagesSuppressSmart": "Heads up: with language hints set, Gemini silently disables Smart mode's cleanup. Clear this field to get it back.",
+        "vocabulary": "Vocabulary biasing",
+        "vocabularyHint": "Comma-separated terms, names and jargon (up to 1000). In testing this had no measurable effect on whether English words stay in Latin script.",
+        "includeCustomWords": "Also send Custom Words",
+        "includeCustomWordsHint": "Reuse the word list you already maintain for the local models. When on, the fuzzy corrector is skipped so a term the model got right is not replaced.",
+        "diarization": "Speaker labels",
+        "diarizationHint": "Tag each segment with a speaker. Up to 8, though Google marks 3+ experimental.",
+        "timestamps": "Word timestamps",
+        "timestampsHint": "Millisecond offsets per word. Google notes this degrades accuracy.",
+        "needsVerbatim": "Requires Verbatim mode — Google does not allow this with Smart."
+      }
     },
     "sound": {
       "title": "Sound",
@@ -568,6 +594,29 @@
           "details": "Handy's local speech-to-text is built on transcribe.cpp and ggml. Thanks to the amazing work by Georgi Gerganov and contributors."
         }
       }
+    },
+    "usage": {
+      "title": "Usage",
+      "overview": "Overview",
+      "activity": "Activity",
+      "byModel": "By model",
+      "spend": "Spend by month",
+      "totalDictations": "Dictations",
+      "totalTime": "Time dictated",
+      "averageLength": "Average length",
+      "thisMonth": "This month",
+      "dictations": "dictations",
+      "time": "Time",
+      "cost": "Cost",
+      "model": "Model",
+      "month": "Month",
+      "cloud": "cloud",
+      "days": "{{count}}d",
+      "empty": "No dictations recorded yet.",
+      "noSpend": "No paid models used yet — everything so far ran locally, for free.",
+      "unmeasured": "{{count}} older dictation(s) predate usage tracking and are counted but not timed.",
+      "estimateNote": "Costs are estimated from audio length and the provider's published rate. No provider exposes a spend API, so your actual invoice will differ slightly.",
+      "beforeTracking": "Before tracking"
     }
   },
   "footer": {

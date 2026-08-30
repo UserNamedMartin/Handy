@@ -37,6 +37,10 @@ const RecordingOverlay: React.FC = () => {
     tentative: "",
   });
   const [phase, setPhase] = useState<StreamPhase>("listening");
+  // Whether the live transcript is shown at all. Off means the streaming card
+  // behaves exactly like the compact one — same pill, same width — because the
+  // panel it would otherwise reserve room for never opens.
+  const [liveText, setLiveText] = useState(true);
   const [workKind, setWorkKind] = useState<StreamWorkKind>("transcribing");
   const [elapsed, setElapsed] = useState(0);
   // Bumped on each new streaming session so the Live card remounts fresh (replays
@@ -69,6 +73,7 @@ const RecordingOverlay: React.FC = () => {
             setPosition(
               settings.data.overlay_position === "top" ? "top" : "bottom",
             );
+            setLiveText(settings.data.show_live_transcript ?? true);
           }
         } catch {
           // Keep the previous/default placement if settings can't be read.
@@ -217,7 +222,9 @@ const RecordingOverlay: React.FC = () => {
   );
 
   // ---- Live overlay: a pill that sculpts open into a panel ----
-  if (state === "streaming") {
+  // Only when the live transcript is actually wanted; otherwise fall through to
+  // the compact pill below — the same shape a non-streaming model gets.
+  if (state === "streaming" && liveText) {
     const hasText =
       streamText.committed.length > 0 || streamText.tentative.length > 0;
     const working = phase === "working";
@@ -271,9 +278,14 @@ const RecordingOverlay: React.FC = () => {
   // ---- Minimal overlay: exactly one row at a time — waveform (recording), or a
   // spinner + label (transcribing / processing). Never both. The pill animates its
   // width between them; the cancel button is in both rows so it stays put.
-  const working = state === "transcribing" || state === "processing";
+  // A streaming run reaching here (live text off) still has to show the working
+  // spinner while it finalizes — that phase arrives as an event, not as a state.
+  const working =
+    state === "transcribing" ||
+    state === "processing" ||
+    (state === "streaming" && phase === "working");
   const workLabel =
-    state === "processing"
+    state === "processing" || (state === "streaming" && workKind === "polishing")
       ? t("overlay.processing")
       : t("overlay.transcribing");
 

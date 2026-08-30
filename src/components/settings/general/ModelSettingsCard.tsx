@@ -4,6 +4,10 @@ import { SettingsGroup } from "../../ui/SettingsGroup";
 import { LanguageSelector } from "../LanguageSelector";
 import { TranslateToEnglish } from "../TranslateToEnglish";
 import { useModelStore } from "../../../stores/modelStore";
+import {
+  CloudModelSettings,
+  isGeminiModel,
+} from "../models/CloudModelSettings";
 import type { ModelInfo } from "@/bindings";
 import {
   CHINESE_LANGUAGE_CODE,
@@ -27,7 +31,8 @@ export const ModelSettingsCard: React.FC = () => {
   const showLanguageSelector =
     supportsLanguageSelection || supportsChineseOnlyScriptSelection;
   const supportsTranslation = currentModelInfo?.supports_translation ?? false;
-  const hasAnySettings = showLanguageSelector || supportsTranslation;
+  const isCloud = isGeminiModel(currentModel ?? undefined);
+  const hasAnySettings = showLanguageSelector || supportsTranslation || isCloud;
 
   // Don't render anything if no model is selected or no settings available
   if (!currentModel || !currentModelInfo || !hasAnySettings) {
@@ -53,6 +58,7 @@ export const ModelSettingsCard: React.FC = () => {
       {supportsTranslation && (
         <TranslateToEnglish descriptionMode="tooltip" grouped={true} />
       )}
+      {isCloud && <CloudModelSettings />}
     </SettingsGroup>
   );
 };
