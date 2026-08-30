@@ -51,16 +51,149 @@ between taps) are consts at the top of `transcription_coordinator.rs`.
   that self-conditioning collapses punctuation into an unbroken wall of text (and can
   trigger repetition loops). Disabling it transcribes each window fresh. Short clips
   (one window) were never affected.
+- **Whisper style primer** (`src-tauri/src/managers/transcription.rs`, `WHISPER_STYLE_PRIMER` + `whisper_initial_prompt()`): whisper-family models now get a short, well-punctuated mixed RU/EN snippet (English terms in Latin) as their `initial_prompt` instead of `None`. whisper's initial_prompt is a *style example* (not an instruction): the model mirrors its punctuation, capitalisation, and Latin-vs-Cyrillic rendering. Measured on a 195-clip corpus of real dictations vs the cloud-consensus reference: Punct-F1 ~73→84, Latin-term retention ~29%→49%, small CER gain; ~zero speed cost; stays under whisper's 224-token budget. Applied per decode window (we run condition_on_prev=false), so it keeps steering style across long dictations without error propagation. Any user `custom_words` are appended to the primer. Non-whisper archs (family=None) are unaffected. Primer chosen by A/B ("P0") over style-only and term-list variants; see `~/tools-for-agents/handy-eval/`.
+- **Whisper pseudo-streaming for long dictations** (`whisper_streaming` setting, default **OFF**; `audio_toolkit/audio/stream_segmenter.rs`, `managers/transcription.rs` `run_whisper_segment_worker` + `transcribe_whisper_segment`, `actions.rs` start-stream gate): whisper isn't a streaming arch, but on long clips we hide the post-release wait by transcribing completed clauses in the background *while you keep talking*. Reuses the existing `StreamRouter` (per-frame `feed`) + streaming-worker engine lease: for a whisper model with the setting on, `run_stream_worker` branches into `run_whisper_segment_worker`, which drives a `StreamSegmenter` (pure state machine, unit-tested: min-segment 10 s, close on 700 ms silence via a coarse RMS gate; the generous minimum is what stops a thinking-pause cutting mid-sentence) over the fed frames, batch-transcribes each closed segment on the leased session with the style primer (+ per-segment `whisper_autogain`), and on Finalize transcribes the open tail and replies with the concatenated text — same contract as the native streaming worker, so `actions.rs` consumes it identically and still batch-falls-back if empty. Measured (offline sim on 22 fresh long clips): ~10 s-segment cutting keeps quality identical to single-shot (Punct-F1 even slightly better — segments stay fresh) while the post-release wait drops to ~1 s regardless of length (156 s clip: 7.1 s→1.1 s). Aggressive short segments hurt punctuation, hence the 10 s floor. **Caveat/known-limit:** incompatible with the whole-utterance `whisper_autogain` deferral — streaming applies auto-gain *per segment* instead. Only the offline path is captured for debug. Needs a real-mic shake-out (no dropped frames / real-time keep-up) before trusting — hence OFF by default. Tuning: `StreamSegmenterConfig` (min_segment_ms / close_on_silence_ms) + `WHISPER_STREAM_SILENCE_RMS`. To try it: set `"whisper_streaming": true` in `settings_store.json` (no UI toggle yet).
 - **Hands-free latch — Space while holding** (`settings.rs`, `shortcut/*`, `transcription_coordinator.rs`, `actions.rs`, `utils.rs`): while a Hybrid recording is live, pressing the `latch` binding (default `fn+space` on macOS) locks it hands-free — release the transcribe key and it keeps recording; press the key again to stop. Built like the Escape/cancel shortcut: a `latch` binding registered dynamically **only while recording** (`register_latch_shortcut`/`unregister_latch_shortcut` in both backends; excluded from `init_shortcuts`), routed in `handler.rs` to `TranscriptionCoordinator::notify_latch()` → `Command::Latch`, which sets `hybrid.latched = true`. handy_keys backend only — fn is a modifier there; the Tauri backend stubs are no-ops.
 - **Compact "Tiny" overlay look + centre-weighted waveform** (`src/overlay/RecordingOverlay.css` + `RecordingOverlay.tsx`): pill ~92/132 px wide, 24 px tall, 14 px radius; 7 bars; dot 5 px, cancel 16 px, spinner 11 px, label 10 px; dot and cancel are inset from their edge by their own vertical-centring gap so they sit symmetric. The waveform pulses **from the centre** (symmetric cosine envelope) driven by the **peak** of the voice band with a curved gain (`MIC_GAIN`/`MIC_CURVE`/`BAR_MIN`/`BAR_MAX` consts in `.tsx`), so it reacts at normal speaking volume — an earlier averaging approach diluted quiet buckets and barely moved.
 - **Waveform sensitivity bump** (`RecordingOverlay.tsx` + `audio_toolkit/audio/visualizer.rs`): the bars still needed near-shouting to move. Raised the response ~1.5× (progressive, quiet helped most) via `MIC_GAIN` 1.7→2.3 and the loudness curve `MIC_CURVE` 0.5→0.45 (exponent <1 lifts quiet more than loud, so loud speech doesn't overshoot the cap). This is a **multiplicative** change so it's ~1.5× more movement for the same input regardless of absolute mic level. Also nudged the spectrum floor `DB_MIN` −55→−58 dBFS in `visualizer.rs` to open a little more low-end range (kept conservative so a quiet room's idle bands still map to ~0). `DB_MIN`/`DB_MAX`/`GAIN`/`CURVE_POWER` in `visualizer.rs` are the upstream (pre-overlay) spectrum mapping; visual only, no effect on VAD/transcription.
 - **Cancel ✕ drawn as CSS bars** (`RecordingOverlay.css` `.sx::before`/`::after`; the `.tsx` cancel button is now empty): the sub-sized inline `<svg>` glyph rendered visibly off-centre inside the round button in the overlay WebView (it was fine in a normal browser). Two absolutely-centred pseudo-element bars (`translate(-50%,-50%)` + `rotate(±45deg)`) centre the ✕ on the button's own centre, so it can't drift regardless of svg rendering.
+- **Overlay window sized to the card** (`src-tauri/src/overlay.rs`): the overlay
+  window is not just a canvas — it swallows every click inside it, so slack
+  beyond the pill is dead space over whatever sits underneath. `OVERLAY_WIDTH` /
+  `OVERLAY_HEIGHT` still described the pre-"Tiny" pill (172/216 wide, 40 tall)
+  long after the CSS moved to 92/132 wide and 24 tall, leaving ~80 px of
+  click-eating margin either side — and 400x120 in streaming mode, around a
+  110 px card. **Keep these in sync with the `--ov-*` vars in
+  RecordingOverlay.css**; nothing enforces it.
 - **Whisper auto-gain — quiet/whispered speech now transcribes** (`src-tauri/src/audio_toolkit/audio/gain.rs` + `recorder.rs`): whispered dictation used to come back empty. Measured cause (harnesses below): the Whisper model handles quiet speech fine, but a whisper sits ~15 dB below normal voice (~−54 vs ~−39 dBFS RMS) and the **Silero VAD gate drops it** before it reaches Whisper — end-to-end WER was 41% (natural whisper) / 98% (faint), vs ~5% for normal voice. Fix: `whisper_autogain()` **conditionally** boosts an utterance — if its RMS is below `WHISPER_LEVEL_DBFS` (−45) it's treated as a whisper and peak-normalized to `BOOST_TARGET_DBFS` (−3, clip-safe, capped at `MAX_BOOST_DB`); at or above that it's normal voice and returned **bit-identical**. So it's **always-on, no mode to toggle** (matches Wispr Flow's "just speak quietly"). Applied in the recorder's **offline path only**: `run_consumer` buffers raw frames when `offline_autogain` is set (whole-utterance level is needed to decide the boost) and runs auto-gain → VAD at stop via `autogain_then_vad`. Result on Martin's recordings: natural whisper 41%→5% WER, faint 98%→~11%, normal voice untouched. Stress-tested: robust to background noise (pink/hum/babble at SNR 5–10 dB → 7–22% WER); no hallucination on boosted non-speech (Silero rejects even loud non-speech). **Not yet covered:** the streaming VAD path (Parakeet-style models) — would need a running AGC; and the boost is disabled there (offline only). Toggle via `AudioRecorder::with_whisper_autogain(false)` if ever needed.
 
 - **Debug capture — rich per-dictation logging** (`src-tauri/src/debug_capture.rs`, `recorder.rs`, `actions.rs`, `settings.rs`): **on by default** (`debug_capture` setting; `debug_capture_limit` = 200). Every dictation writes `~/Library/Application Support/com.pais.handy/debug/<timestamp>/`:
   - `raw.wav` — the **untouched raw capture** (16 kHz mono), before auto-gain and VAD — exactly what the tuning harnesses consume, so any real dictation can be replayed/re-tuned offline.
   - `meta.json` — `transcribe_ms`; audio stats (raw duration, RMS/peak dBFS); the auto-gain decision (`classified_whisper`, `applied_gain_db`); VAD stats (`frames_in`/`frames_kept`/`kept_ratio`); the raw + final (+ post-processed) transcript; and a settings snapshot (model, vad_enabled).
   Bundles are pruned to the newest `debug_capture_limit`. This is **separate from and does not touch** the native history (`history.db` + `recordings/`). Plumbing: the recorder stashes a `CaptureDebug { raw, autogain_db, classified_whisper, vad_frames_in, vad_frames_kept }` at stop (offline path), drained via `RecordingManager::take_capture_debug()` in `actions.rs`, which writes the bundle after transcription. Only the offline (whisper-autogain) path is captured; streaming isn't. Detected language isn't logged yet (`transcribe()` returns only text).
+
+### Cloud transcription backends (`src-tauri/src/cloud/`)
+The first non-local engines. Handy stays offline-first: a cloud model only runs
+when explicitly selected from the **Cloud** category in the model list, and it
+sends raw dictation audio to a third party.
+
+- **`EngineType::Gemini` + `ModelSource::Cloud { provider }`** (`managers/model.rs`):
+  a catalog entry with no file — `size_mb: 0`, permanently `is_downloaded: true`
+  (reasserted in `update_download_status`), and refused by `download_model` /
+  `delete_model` / `get_model_path`. Two entries ship: `gemini-3.5-transcribe`
+  (batch) and `gemini-3.5-transcribe-live` (streaming).
+- **`cloud/gemini.rs` — batch.** One POST per dictation to the Interactions API
+  with the WAV inlined as base64. `LoadedEngine::Gemini` holds only an HTTP
+  client, so load/unload is free. **Measured: a hard ~3 s floor per request** —
+  a 3 s clip and a 21 s clip both take ~3 s, upload is 12–57 ms even at 5.9 MB,
+  so it is fixed server-side cost, not transfer. That makes batch *slower than
+  local whisper* on the 62% of dictations under 30 s.
+- **`cloud/gemini_live.rs` — streaming, and the reason to use the cloud at all.**
+  WebSocket (`tokio-tungstenite` on the rustls stack reqwest already links).
+  Transcribes while you talk, so key-release leaves only the tail: **measured
+  219–507 ms**, against 1.6–23 s for local whisper. Connection + setup (~700 ms)
+  is paid when recording starts, overlapping the first words. Interim hypotheses
+  drive the overlay's `tentative` text, finalized chunks its `committed` prefix.
+- **`run_gemini_live_worker`** (`managers/transcription.rs`) implements the same
+  `StreamCmd` contract as the native streaming worker, so `actions.rs` consumes
+  it identically — **an empty result batch-falls-back**, meaning a dead socket
+  costs latency, never the dictation.
+- **`cloud::block_on`** — `transcribe()` is sync but is called both from a tokio
+  worker thread (`actions.rs`, inside an `async fn`) and from `spawn_blocking`.
+  `Runtime::block_on` and `reqwest::blocking` both panic inside a runtime, so
+  requests hop to a scratch OS thread with no runtime context.
+
+**Gotchas found by probing the live service, not the docs:**
+- `output_text` is **always null** on the REST surface (it is an SDK convenience);
+  the transcript must be assembled from `steps[].content[].text`.
+- Live final chunks are **whole sentences with no padding**, so a naive
+  concatenation yields `"чата.И там"` — join with a single space.
+- **`SMART` mode is silently disabled when `languageCodes` is non-empty.** You
+  get filler-word removal *or* a language hint, never both. Surfaced in the UI.
+- **`turnComplete` never arrives.** It means "the model finished *its* turn", and
+  a transcription-only session has no model turn — the socket just stays open
+  waiting for you to speak again. Verified by holding it open 30 s after the
+  tail: final chunk, `generationComplete`, then nothing, connection still live.
+  Waiting on `turnComplete` is waiting forever.
+- **Manual activity detection, and no client-side audio processing.** Google's
+  guidance for the Live API is to send raw 16-bit PCM and let the service decide;
+  their own macOS client (`google-gemini/jot-gemini-transcribe-macOS`) gates
+  nothing, and its only level-measuring type is documented as "always runs, and
+  it decides nothing". It also sets
+  `realtimeInputConfig.automaticActivityDetection.disabled` and brackets the turn
+  with `activityStart` / `activityEnd`, because server-side voice detection "would
+  cut turns in the middle of someone pausing to think". This fork now does the
+  same, and `actions.rs` puts cloud models on `VadPolicy::Disabled`: Handy's gate
+  exists to spare *local* engines audio they handle badly, and it passed 98% of
+  frames at normal volume but only 15-22% of a faint whisper (`examples/
+  vad_whisper_gate.rs`), because `whisper_autogain` compensates on the offline
+  path only. Gemini transcribes that same faint whisper perfectly when given it.
+  `activityEnd` must never overtake queued audio — safe here because `Outbound`
+  is FIFO through the single socket-writing loop.
+- **`generationComplete` fires after every finalized chunk** (seven times on an
+  89 s dictation), so on its own it means "that sentence is done". It only means
+  "the turn is done" *after* `audioStreamEnd` — that is the end signal, and it
+  lands with the tail at ~end+0.35 s. Getting this wrong in either direction
+  costs real damage: treating it as unconditional truncated an 89 s dictation to
+  48 characters; ignoring it entirely forced a 600 ms idle-timeout on every
+  dictation.
+- `custom_vocabulary` is accepted on both endpoints but showed **no measurable
+  effect** on Latin-vs-Cyrillic rendering in testing.
+- Streaming scores *worse* than batch (4.0% vs 2.6% AA-WER); the latency is the
+  entire reason to prefer it.
+
+Settings live in `GeminiTranscribeSettings` (mode / language_codes /
+custom_vocabulary / include_custom_words / diarization / timestamps) plus
+`cloud_api_keys: SecretMap`. The key may also come from `HANDY_GEMINI_API_KEY`
+for headless runs; the stored setting wins. `custom_words_sent_to_model` now
+gates the fuzzy post-corrector — running it on top of `custom_vocabulary` would
+replace a term the model already got right with a near-miss from the same list.
+
+### Testing a streaming backend without a microphone
+`--stream` drives a WAV through the **real** streaming worker — engine lease,
+socket teardown, batch fallback and all — because that is where every bug in
+this backend actually lived. A protocol-level prototype reproduces none of it.
+
+```bash
+./target/debug/handy --transcribe-file <clip>.wav \
+  --model gemini-3.5-transcribe-live --stream --json
+```
+
+Three flags exist because each one caught a bug a simpler run could not:
+- **`--repeat N`** runs N dictations *in one process*. The first Live build
+  stranded the engine lease, so run 1 looked perfect and every run after it
+  failed with `Model is not loaded for transcription`. Separate processes never
+  show it.
+- **`--stream-trailing-silence-ms MS`** keeps the key held without speaking
+  before finalizing. Finalizing the instant the audio ends is the *easy* case;
+  pausing first is what left a flat 20 s wait, because the transcript was
+  already complete and the code was waiting for more.
+- The feed is paced to wall-clock. Dumping 21 s of audio in milliseconds is not
+  a faster version of the same test — the service returned nothing at all.
+
+`engine_returned` in the JSON is the regression canary: false means the lease
+was stranded and every later dictation is broken, which the transcript alone
+would not reveal. `source` distinguishes `stream` from `batch-fallback`.
+
+`examples/vad_whisper_gate.rs` measures what fraction of a clip survives
+Handy's VAD, using the recorder's own detector, threshold and hangover.
+
+### Usage & spend tracking (`Usage` sidebar section)
+`transcription_history` gained nullable `duration_ms` / `model_id` / `engine` /
+`cost_usd` (migrations in `managers/history.rs`), written per dictation by
+`dictation_usage()` in `actions.rs`. Failed transcriptions record a duration but
+**no cost** — billing a request that produced nothing would inflate the report.
+
+`usage_daily` / `usage_monthly` / `usage_summary` aggregate in SQL (local-time
+day and month buckets); commands are in `commands/history.rs`. The UI
+(`components/settings/usage/UsageSettings.tsx`) shows totals, a daily activity
+chart, a per-model split and a monthly spend retrospective.
+
+**Costs are estimates.** No provider exposes a spend API — Google's billing lives
+in Cloud Console — so `cloud::estimate_cost_usd` multiplies billed duration by the
+published blended rate ($0.005/min batch, $0.009/min Live). Buckets also carry
+`measured`, the count of entries that actually had a duration, so pre-migration
+history reads as "untimed" rather than as a quiet week.
 
 **Whisper-mode tuning harnesses (in-repo, not part of the app build):** `src-tauri/examples/whisper_gain_sweep.rs` (gain × VAD-threshold sweep → WER + VAD pass-rate + end-to-end gated WER), `whisper_stress.rs` (silence-hallucination + noise robustness), `whisper_gate_tune.rs` (VAD threshold sweep), `whisper_halluc_guard.rs` (decoder `no_speech_thold`/`logprob_thold`). They read WAV corpora in `examples/whisper_corpus/` (real recordings) and `examples/whisper_stress/` (synthesized). Corpus captured with a Playwright-driven raw-mic recorder page (getUserMedia with AGC/NS/EC off). Run e.g. `cargo run --release --example whisper_gain_sweep`.
 
@@ -178,6 +311,17 @@ security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k handydev \
 security list-keychains -d user -s ~/Library/Keychains/handy-signing.keychain-db \
   $(security list-keychains -d user | sed -e 's/"//g')
 ```
+
+**Editing `settings_store.json` while an OLD build is running silently discards
+your edit.** The store round-trips through the running app's in-memory copy, so
+a binary that predates a settings field drops that field entirely on quit — not
+just its value, the key. This ate the Gemini API key and the whole
+`gemini_transcribe` block once. Quit Handy first, edit, then relaunch; or make
+the edit from a build that already knows the field.
+
+The cloud API key lives at `settings.cloud_api_keys.gemini`; headless runs can
+use `HANDY_GEMINI_API_KEY` instead (the stored setting wins). Neither ever
+belongs in this repo.
 
 **Don't leave the build-copy around.** `src-tauri/target/release/bundle/macos/Handy.app`
 shows up in Spotlight as a second "Handy". Deleting `src-tauri/target/release/bundle/` is
