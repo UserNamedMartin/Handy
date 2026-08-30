@@ -46,3 +46,5 @@ result
 # Whisper-mode tuning corpora (personal voice recordings + synthesized audio; regenerable, not code)
 src-tauri/examples/whisper_corpus/
 src-tauri/examples/whisper_stress/
+# Python bytecode (scripts/)
+__pycache__/

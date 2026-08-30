@@ -87,7 +87,7 @@ fn main() -> Result<()> {
     eprintln!("loading {model_path} (metal)…");
     let model = Model::load_with(
         Path::new(&model_path),
-        &ModelOptions { backend: Backend::Metal, gpu_device: 0 },
+        &ModelOptions { backend: Backend::Metal, device: None },
     )?;
     let mut session = model.session()?;
 

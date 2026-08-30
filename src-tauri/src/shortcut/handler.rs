@@ -18,8 +18,8 @@ use crate::TranscriptionCoordinator;
 /// This function contains the shared logic for:
 /// - Looking up the action in ACTION_MAP
 /// - Handling the cancel binding (only fires when recording)
-/// - Handling push-to-talk mode (start on press, stop on release)
-/// - Handling toggle mode (toggle state on press only)
+/// - Routing transcribe bindings to the coordinator, which applies the
+///   configured activation mode (toggle / push-to-talk / hold-or-toggle)
 ///
 /// # Arguments
 /// * `app` - The Tauri app handle
@@ -34,33 +34,31 @@ pub fn handle_shortcut_event(
 ) {
     let settings = get_settings(app);
 
-    // Transcribe bindings are handled by the coordinator.
-    if is_transcribe_binding(binding_id) {
-        if let Some(coordinator) = app.try_state::<TranscriptionCoordinator>() {
-            // Resolve the activation mode for THIS binding. A binding can
-            // override the app-wide `push_to_talk` flag via its own
-            // `activation_mode` (a hands-free Toggle key, or a Hybrid key that is
-            // hold-to-talk plus double-tap-to-lock).
-            let mode = settings
-                .bindings
-                .get(binding_id)
-                .map(|b| b.activation_mode)
-                .unwrap_or_default()
-                .resolve(settings.push_to_talk);
-            coordinator.send_input(binding_id, hotkey_string, is_pressed, mode);
-        } else {
-            warn!("TranscriptionCoordinator is not initialized");
-        }
-        return;
-    }
-
-    // Latch: lock a live Hybrid recording hands-free (fires only on press). Not
-    // in ACTION_MAP — handled here like a control key.
+    // Fork binding: the hands-free latch. Registered only while recording, so
+    // reaching here means a recording is live — lock it on and let go of the
+    // transcribe key. Press-only; its release means nothing.
     if binding_id == "latch" {
         if is_pressed {
             if let Some(coordinator) = app.try_state::<TranscriptionCoordinator>() {
                 coordinator.notify_latch();
             }
+        }
+        return;
+    }
+
+    // Transcribe bindings are handled by the coordinator.
+    if is_transcribe_binding(binding_id) {
+        if let Some(coordinator) = app.try_state::<TranscriptionCoordinator>() {
+            coordinator.send_input(
+                binding_id,
+                hotkey_string,
+                is_pressed,
+                settings.shortcut_activation,
+                std::time::Duration::from_millis(settings.hold_threshold_ms),
+                std::time::Duration::from_millis(settings.double_tap_window_ms),
+            );
+        } else {
+            warn!("TranscriptionCoordinator is not initialized");
         }
         return;
     }

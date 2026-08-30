@@ -1,15 +1,18 @@
 use rustfft::{num_complex::Complex32, Fft, FftPlanner};
 use std::sync::Arc;
 
-// DB_MIN is the loudness mapped to "bar at rest". Nudged -55 → -58 to open the
-// low end a little so quiet speech occupies more of the 0..1 range, kept
-// conservative so a quiet room's idle bands still map to ~0 (the bulk of the
-// sensitivity increase is the multiplicative MIC_GAIN/curve in the overlay
-// .tsx, which is safe regardless of absolute mic level). Visual only — does not
-// affect VAD or transcription. Drop toward -62 for more quiet reach; raise back
-// toward -55 if idle jitters in a noisier room.
-const DB_MIN: f32 = -58.0;
-const DB_MAX: f32 = -8.0;
+// `db` below is not true dBFS: it's a per-bin average divided by the FFT
+// window size, which lands ~20 dB low for speech. So this window is calibrated
+// against measured mic audio (dictation ~-32 dBFS, room tone ~-48 dBFS) rather
+// than absolute dBFS. The old -55/-8 left speech ~1 px above the overlay's
+// floor, which reads as a frozen waveform (#1694). Not lowered past -68: at
+// -70 a noisy room starts making the idle waveform twitch.
+//
+// Fork note: this replaces our own -58/-8 nudge, which was chasing the same
+// symptom from the wrong end. The overlay's MIC_GAIN/MIC_CURVE sit on top of
+// this and may now overshoot — check the bars before trusting them.
+const DB_MIN: f32 = -68.0;
+const DB_MAX: f32 = -30.0;
 const GAIN: f32 = 1.3;
 const CURVE_POWER: f32 = 0.7;
 

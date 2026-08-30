@@ -31,6 +31,10 @@ const RecordingOverlay: React.FC = () => {
   const { t } = useTranslation();
   const [isVisible, setIsVisible] = useState(false);
   const [state, setState] = useState<OverlayState>("recording");
+  // `Stream::play()` returning does not mean hardware callbacks are flowing.
+  // Stay visually in an arming state until the backend processes the first
+  // actual microphone sample chunk.
+  const [captureReady, setCaptureReady] = useState(false);
   const [levels, setLevels] = useState<number[]>(Array(WAVE_BARS).fill(0));
   const [streamText, setStreamText] = useState<StreamTextEvent>({
     committed: "",
@@ -64,6 +68,17 @@ const RecordingOverlay: React.FC = () => {
   useEffect(() => {
     const setupEventListeners = async () => {
       const unlistenShow = await listen("show-overlay", async (event) => {
+        const overlayState = event.payload as OverlayState;
+        // Reset synchronously before settings I/O. A fast microphone can emit
+        // recording-ready while the awaits below are in flight; resetting after
+        // them would overwrite that event and leave the overlay stuck arming.
+        if (overlayState === "recording" || overlayState === "streaming") {
+          setCaptureReady(false);
+          smoothedLevelsRef.current = Array(16).fill(0);
+          setLevels(Array(WAVE_BARS).fill(0));
+          setStreamText({ committed: "", tentative: "" });
+        }
+
         await syncLanguageFromSettings();
         // The Live panel flows downward from a top overlay and upward from a
         // bottom one; read the placement so the layout can flip to match.
@@ -78,11 +93,7 @@ const RecordingOverlay: React.FC = () => {
         } catch {
           // Keep the previous/default placement if settings can't be read.
         }
-        const overlayState = event.payload as OverlayState;
         setState(overlayState);
-        if (overlayState === "recording" || overlayState === "streaming") {
-          setStreamText({ committed: "", tentative: "" });
-        }
         if (overlayState === "streaming") {
           setPhase("listening");
           setWorkKind("transcribing");
@@ -94,6 +105,12 @@ const RecordingOverlay: React.FC = () => {
 
       const unlistenHide = await listen("hide-overlay", () => {
         setIsVisible(false);
+        setCaptureReady(false);
+      });
+
+      const unlistenReady = await listen("recording-ready", () => {
+        setElapsed(0);
+        setCaptureReady(true);
       });
 
       const unlistenLevel = await listen<number[]>("mic-level", (event) => {
@@ -121,6 +138,7 @@ const RecordingOverlay: React.FC = () => {
       return () => {
         unlistenShow();
         unlistenHide();
+        unlistenReady();
         unlistenLevel();
         unlistenStream();
         unlistenPhase();
@@ -130,12 +148,12 @@ const RecordingOverlay: React.FC = () => {
     setupEventListeners();
   }, []);
 
-  // Elapsed timer while the Live overlay is visible.
+  // Elapsed capture timer starts only once microphone samples are flowing.
   useEffect(() => {
-    if (state !== "streaming" || !isVisible) return;
+    if (state !== "streaming" || !isVisible || !captureReady) return;
     const id = setInterval(() => setElapsed((e) => e + 1), 1000);
     return () => clearInterval(id);
-  }, [state, isVisible]);
+  }, [state, isVisible, captureReady]);
 
   // Stick to the bottom as text streams in — but only while pinned, so a user who
   // has scrolled up to read history isn't yanked back down by the next chunk.
@@ -152,6 +170,8 @@ const RecordingOverlay: React.FC = () => {
     pinnedRef.current = true;
     setOverflowing(false);
   }, [session]);
+
+  if (!isVisible) return null;
 
   // Re-pin when the user is within ~a line of the bottom; unpin otherwise.
   const handleStreamScroll = () => {
@@ -172,7 +192,15 @@ const RecordingOverlay: React.FC = () => {
   const peak = levels.length ? Math.max(...levels) : 0;
   const loud = Math.min(1, Math.pow(peak, MIC_CURVE) * MIC_GAIN);
   const waveform = (
-    <div className="swave">
+    // Fork: centre-weighted envelope driven by the voice band's peak, kept over
+    // upstream's flat mapping because it is what the "Tiny" pill was tuned
+    // against. Upstream's arming/ready class is adopted so the mic-warming
+    // animation still works.
+    //
+    // NOTE: upstream also recalibrated the spectrum window in visualizer.rs
+    // (-55/-8 -> -68/-30), so MIC_GAIN/MIC_CURVE now sit on a wider input range
+    // and may want re-tuning — check the bars before trusting them.
+    <div className={`swave ${captureReady ? "ready" : "arming"}`}>
       {Array.from({ length: WAVE_BARS }).map((_, i) => {
         const dist = center > 0 ? Math.abs(i - center) / center : 0;
         const env = 0.3 + 0.7 * Math.cos((dist * Math.PI) / 2);
@@ -199,7 +227,7 @@ const RecordingOverlay: React.FC = () => {
   const listeningRow = (showTimer: boolean, showCancel: boolean) => (
     <div className="sbase">
       <div className="sbase-l">
-        <span className="sdot" />
+        <span className={`sdot ${captureReady ? "ready" : "arming"}`} />
       </div>
       {waveform}
       <div className="sbase-r">

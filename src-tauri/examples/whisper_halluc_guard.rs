@@ -95,7 +95,7 @@ fn list(dir: &str, pfx: &str) -> Vec<PathBuf> {
 
 fn main() -> Result<()> {
     eprintln!("loading…");
-    let model = Model::load_with(Path::new(MODEL_PATH), &ModelOptions { backend: Backend::Metal, gpu_device: 0 })?;
+    let model = Model::load_with(Path::new(MODEL_PATH), &ModelOptions { backend: Backend::Metal, device: None })?;
     let mut s = model.session()?;
     let mut vad = Vad::new(SILERO_PATH, SR).map_err(|e| anyhow::anyhow!("vad: {e}"))?;
 
