@@ -4,8 +4,8 @@
 //!
 //! Run from `src-tauri/`, configured via env vars:
 //!   MODEL_PATH=/abs/path/to/model.gguf \
-//!   CORPUS_DIR=/Users/martinmourzenkov/tools-for-agents/handy-eval/corpus \
-//!   OUT_PATH=/Users/martinmourzenkov/tools-for-agents/handy-eval/local_runs/<tag>.jsonl \
+//!   CORPUS_DIR=$HOME/tools-for-agents/handy-eval/corpus \
+//!   OUT_PATH=$HOME/tools-for-agents/handy-eval/local_runs/<tag>.jsonl \
 //!   PRIMER=""            # optional initial prompt (default none)
 //!   COND_PREV=false      # condition_on_prev_tokens (default false, matches fork)
 //!   cargo run --release --example corpus_bench
@@ -68,7 +68,7 @@ fn main() -> Result<()> {
     eprintln!("loading {model_path} (metal)…");
     let model = Model::load_with(
         Path::new(&model_path),
-        &ModelOptions { backend: Backend::Metal, gpu_device: 0 },
+        &ModelOptions { backend: Backend::Metal, device: None },
     )?;
     let mut session = model.session()?;
 

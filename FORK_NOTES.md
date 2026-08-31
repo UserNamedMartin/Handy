@@ -13,34 +13,53 @@ Bundle id: `com.pais.handy` (same as the official app → shares settings/models
 
 ## Custom features in this fork (not upstream)
 
-### Per-binding activation mode + dedicated hands-free toggle key
-All fork work lives directly on `main` (this is a personal fork — no feature-branch ceremony; commit straight to `main`).
+### Key activation: `HoldOrDoubleTap`
+All fork work lives directly on `main` (this is a personal fork — no
+feature-branch ceremony; commit straight to `main`).
 
-Upstream has a single global `push_to_talk` flag that forces **every** transcribe
-binding into hold-to-talk (`true`) or toggle (`false`). This fork lets **each binding
-choose its own mode** via `ActivationMode { Global, PushToTalk, Toggle, Hybrid }`,
-and ships a second transcribe binding.
+**This used to be a whole parallel state machine and no longer is.** Upstream
+shipped its own `ShortcutActivation { Toggle, PushToTalk, HoldOrToggle }` with a
+configurable `hold_threshold_ms` in v0.9.6 — their take on what this fork built
+in July. Carrying a second implementation of their feature is what made that
+merge expensive, and it would have cost the same again every release. Their
+coordinator is now used wholesale; the fork owns **one enum variant**:
 
-`Hybrid` = the "Wispr Flow" one-key experience: **hold** to talk (push-to-talk),
-**double-tap** to lock hands-free recording, **tap** once more to stop. Implemented in
-the coordinator via `evaluate_hybrid` + a double-tap-window timeout.
+- **`HoldOrDoubleTap`** (the fork default) — hold to talk and release to stop,
+  a **lone tap does nothing**, a **double tap** inside `double_tap_window_ms`
+  locks recording on until the next press.
 
-Default behaviour after this change:
-- `transcribe` → `ActivationMode::Hybrid` (hold, or double-tap to latch hands-free).
-- `transcribe_toggle` → `ActivationMode::Toggle` (press once = start, press again = stop). Default key `ctrl+option+space` on macOS.
-- `Global` still follows the app-wide Push-To-Talk toggle (used by `transcribe_with_post_process`).
+Upstream's `HoldOrToggle` latches on a *single* tap. That is fine for a normal
+hotkey and wrong for this setup, where the transcribe key is `fn`: a stray brush
+against a modifier would start a live recording. One deliberate gesture buys
+immunity to that. The mode is app-wide and switchable in
+General → Shortcut Behavior, so upstream's single-tap variant is one click away
+if the extra tap ever annoys.
 
-Files touched (keep them consistent if you extend this):
-- `src-tauri/src/settings.rs` — `enum ActivationMode { Global, PushToTalk, Toggle, Hybrid }` with `resolve(global_ptt) -> ActivationMode` (maps `Global` → PushToTalk/Toggle; never returns `Global`); `activation_mode` field on `ShortcutBinding` (`#[serde(default)]` → `Global` for old stores); `transcribe` default is `Hybrid`; new default `transcribe_toggle` binding. New default bindings are auto-back-filled into existing settings stores by the merge in `get_settings()`.
-- `src-tauri/src/shortcut/handler.rs` — resolves each binding's `ActivationMode` and passes it to the coordinator instead of the global bool.
-- `src-tauri/src/transcription_coordinator.rs` — `send_input`/`Command::Input` now carry an `ActivationMode`. `PushToTalk`/`Toggle` use the existing logic; `Hybrid` runs `evaluate_hybrid` (hold vs quick-tap vs double-tap-latch) with the double-tap window enforced by the coordinator loop's timeout. `is_transcribe_binding()` also matches `transcribe_toggle`. Unit tests cover hold / double-tap-latch / lone-tap. Single-slot `Stage` means only one binding records at a time.
-- `src-tauri/src/signal_handle.rs` — CLI/signal triggers send `ActivationMode::Toggle`.
-- `src-tauri/src/actions.rs` — `ACTION_MAP` maps `transcribe_toggle` → `TranscribeAction { post_process: false }`.
-- `src/components/settings/general/GeneralSettings.tsx` — renders a second `<ShortcutInput shortcutId="transcribe_toggle" />`. Labels fall back to the binding's Rust `name`/`description` via `t(key, defaultValue)`.
+The **`latch` binding** (`fn+space`, registered only while recording) survives as
+a second way into the lock upstream already models — press it mid-hold and the
+transcribe key can be released.
 
-### Tuning the Hybrid feel
-`HOLD_THRESHOLD` (300 ms — hold vs tap) and `DOUBLE_TAP_WINDOW` (400 ms — max gap
-between taps) are consts at the top of `transcription_coordinator.rs`.
+What the fork used to have and deliberately dropped: `ActivationMode` per
+binding, and the `transcribe_toggle` key. One app-wide mode plus the latch key
+covers both, and 200 consecutive dictations had used nothing but `transcribe`.
+
+Where the variant lives (keep these together if you extend it):
+- `settings.rs` — the `HoldOrDoubleTap` variant, `double_tap_window_ms`, and a
+  **fork-specific migration**: a pre-merge store says `push_to_talk: true` *and*
+  `transcribe.activation_mode: hybrid`, and the binding won. Upstream's
+  migration reads the bool alone, which would silently downgrade exactly the
+  users who had configured hands-free. Covered by tests both ways.
+- `transcription_coordinator.rs` — `PendingTap` + `tap_deadline()`, resolved by
+  `on_tap_expired()`. This reuses upstream's own deferred-decision machinery
+  (they already defer a release by a grace window to absorb X11 auto-repeat);
+  `next_deadline()` sleeps until whichever timer lands first. `Command::Latch` →
+  `on_latch()` sets the same `locked` flag a double tap sets.
+- `shortcut/handler.rs` — routes the `latch` binding to `notify_latch()`.
+
+Eight unit tests cover the variant and the latch: long hold stops, lone tap
+starts nothing lasting, second tap locks, a late second tap does not, latch
+locks a live hold, cancel clears a pending window, and `next_deadline` picks the
+nearer timer. Upstream's 36 coordinator tests still pass unchanged.
 
 ### Other local fixes
 - **Fullscreen-aware overlay position** (`src-tauri/src/overlay.rs`): the bottom anchor used only macOS `work_area`, which a background app is handed as the *desktop's* Dock-reserved frame even when another app is in fullscreen — so the pill floated up "as if the Dock were there." Fixed with `dock_state::dock_is_on_screen()` (hand-declared `CGWindowList` + `core-foundation` externs): ask the window server directly whether the Dock's tile-bar window (owner `"Dock"`, layer 20 = `kCGDockWindowLevel`) is currently on screen. No Dock on screen (fullscreen space or auto-hidden) → anchor to the physical screen bottom; Dock on screen → above it via `work_area`. This is **app-agnostic** — an earlier attempt used the Accessibility `AXFullScreen` attribute, which works for native apps but NOT Electron apps (Claude, ChatGPT), so their fullscreen still floated high; the CGWindowList check works for all. No screen-recording permission needed (metadata only). Added dep: `core-foundation` (macOS).
@@ -55,7 +74,15 @@ between taps) are consts at the top of `transcription_coordinator.rs`.
 - **Whisper pseudo-streaming for long dictations** (`whisper_streaming` setting, default **OFF**; `audio_toolkit/audio/stream_segmenter.rs`, `managers/transcription.rs` `run_whisper_segment_worker` + `transcribe_whisper_segment`, `actions.rs` start-stream gate): whisper isn't a streaming arch, but on long clips we hide the post-release wait by transcribing completed clauses in the background *while you keep talking*. Reuses the existing `StreamRouter` (per-frame `feed`) + streaming-worker engine lease: for a whisper model with the setting on, `run_stream_worker` branches into `run_whisper_segment_worker`, which drives a `StreamSegmenter` (pure state machine, unit-tested: min-segment 10 s, close on 700 ms silence via a coarse RMS gate; the generous minimum is what stops a thinking-pause cutting mid-sentence) over the fed frames, batch-transcribes each closed segment on the leased session with the style primer (+ per-segment `whisper_autogain`), and on Finalize transcribes the open tail and replies with the concatenated text — same contract as the native streaming worker, so `actions.rs` consumes it identically and still batch-falls-back if empty. Measured (offline sim on 22 fresh long clips): ~10 s-segment cutting keeps quality identical to single-shot (Punct-F1 even slightly better — segments stay fresh) while the post-release wait drops to ~1 s regardless of length (156 s clip: 7.1 s→1.1 s). Aggressive short segments hurt punctuation, hence the 10 s floor. **Caveat/known-limit:** incompatible with the whole-utterance `whisper_autogain` deferral — streaming applies auto-gain *per segment* instead. Only the offline path is captured for debug. Needs a real-mic shake-out (no dropped frames / real-time keep-up) before trusting — hence OFF by default. Tuning: `StreamSegmenterConfig` (min_segment_ms / close_on_silence_ms) + `WHISPER_STREAM_SILENCE_RMS`. To try it: set `"whisper_streaming": true` in `settings_store.json` (no UI toggle yet).
 - **Hands-free latch — Space while holding** (`settings.rs`, `shortcut/*`, `transcription_coordinator.rs`, `actions.rs`, `utils.rs`): while a Hybrid recording is live, pressing the `latch` binding (default `fn+space` on macOS) locks it hands-free — release the transcribe key and it keeps recording; press the key again to stop. Built like the Escape/cancel shortcut: a `latch` binding registered dynamically **only while recording** (`register_latch_shortcut`/`unregister_latch_shortcut` in both backends; excluded from `init_shortcuts`), routed in `handler.rs` to `TranscriptionCoordinator::notify_latch()` → `Command::Latch`, which sets `hybrid.latched = true`. handy_keys backend only — fn is a modifier there; the Tauri backend stubs are no-ops.
 - **Compact "Tiny" overlay look + centre-weighted waveform** (`src/overlay/RecordingOverlay.css` + `RecordingOverlay.tsx`): pill ~92/132 px wide, 24 px tall, 14 px radius; 7 bars; dot 5 px, cancel 16 px, spinner 11 px, label 10 px; dot and cancel are inset from their edge by their own vertical-centring gap so they sit symmetric. The waveform pulses **from the centre** (symmetric cosine envelope) driven by the **peak** of the voice band with a curved gain (`MIC_GAIN`/`MIC_CURVE`/`BAR_MIN`/`BAR_MAX` consts in `.tsx`), so it reacts at normal speaking volume — an earlier averaging approach diluted quiet buckets and barely moved.
-- **Waveform sensitivity bump** (`RecordingOverlay.tsx` + `audio_toolkit/audio/visualizer.rs`): the bars still needed near-shouting to move. Raised the response ~1.5× (progressive, quiet helped most) via `MIC_GAIN` 1.7→2.3 and the loudness curve `MIC_CURVE` 0.5→0.45 (exponent <1 lifts quiet more than loud, so loud speech doesn't overshoot the cap). This is a **multiplicative** change so it's ~1.5× more movement for the same input regardless of absolute mic level. Also nudged the spectrum floor `DB_MIN` −55→−58 dBFS in `visualizer.rs` to open a little more low-end range (kept conservative so a quiet room's idle bands still map to ~0). `DB_MIN`/`DB_MAX`/`GAIN`/`CURVE_POWER` in `visualizer.rs` are the upstream (pre-overlay) spectrum mapping; visual only, no effect on VAD/transcription.
+- **Waveform sensitivity** (`src/overlay/RecordingOverlay.tsx`): the fork raised
+  `MIC_GAIN`/`MIC_CURVE` because the bars needed near-shouting to move. Upstream
+  later fixed the same complaint at the root — `db` in `visualizer.rs` is not
+  true dBFS but a per-bin average, landing ~20 dB low for speech, so they
+  recalibrated the window against measured audio (`-68/-30`) instead of nudging
+  it (`-58/-8`). **Their calibration is the one in the tree now.** The fork keeps
+  its centre-weighted envelope (the "Tiny" pill was tuned against it) but that
+  envelope now sits on a wider input range, so the gain constants may want
+  re-tuning — check the bars before trusting them.
 - **Cancel ✕ drawn as CSS bars** (`RecordingOverlay.css` `.sx::before`/`::after`; the `.tsx` cancel button is now empty): the sub-sized inline `<svg>` glyph rendered visibly off-centre inside the round button in the overlay WebView (it was fine in a normal browser). Two absolutely-centred pseudo-element bars (`translate(-50%,-50%)` + `rotate(±45deg)`) centre the ✕ on the button's own centre, so it can't drift regardless of svg rendering.
 - **Overlay window sized to the card** (`src-tauri/src/overlay.rs`): the overlay
   window is not just a canvas — it swallows every click inside it, so slack
@@ -331,14 +358,45 @@ safe (regenerated on rebuild; keeps the compile cache) — but keep the rest of 
 
 ## Sync with upstream
 
-Your `main` has diverged from the original (that's expected for a personal fork).
-To pull the original's updates into it:
+Last synced: **v0.9.6** (2026-08-30, 80 upstream commits). `main` has diverged
+from the original — expected for a personal fork.
 
 ```bash
 git fetch upstream
-git checkout main
-git merge upstream/main          # or: git rebase upstream/main
-# likely conflict files: settings.rs, shortcut/handler.rs, GeneralSettings.tsx,
-# overlay.rs, RecordingOverlay.{css,tsx} — see the "Custom features" / "Other
-# local fixes" sections above to re-apply intent, then rebuild.
+git tag -a working-<date> -m "known-good before the merge"   # rollback in one command
+git checkout -b merge-upstream-<version>
+git merge upstream/main
 ```
+
+Merge on a branch, never on `main` directly: the installed build should stay
+reachable while the merge is in pieces.
+
+**Where the conflicts actually come from.** The cloud backend — the largest
+thing this fork adds — produced *zero* conflicts in the v0.9.6 merge, because it
+lives in files upstream does not have. Every painful conflict came from a place
+where the fork had written its own version of something upstream also owns.
+Keep new work in new files, and prefer adopting upstream's implementation over
+maintaining a parallel one; the cost is not the first merge, it is every merge
+after it.
+
+Expect conflicts in: `settings.rs`, `transcription.rs`, `recorder.rs`,
+`overlay.rs`, `actions.rs`, `bindings.ts` (generated — resolve by rebuilding),
+`translation.json`, `RecordingOverlay.{css,tsx}`.
+
+**After merging, before trusting it:**
+```bash
+cargo test                                   # 300+ tests, incl. the fork's key modes
+./target/debug/handy --transcribe-file <clip>.wav \
+  --model gemini-3.5-transcribe-live --stream --repeat 3
+```
+`engine_returned=false` or `source=batch-fallback` means a regression. Neither is
+visible in the transcript alone.
+
+Lessons that cost time in v0.9.6, worth checking every sync:
+- `transcribe-cpp` majors rename things (`ModelOptions.gpu_device` →
+  `device: Option<Device>`); the in-repo `examples/` break silently because
+  `cargo build` does not compile them.
+- Blanket "keep both sides" on a conflict is wrong when upstream *replaced*
+  something — it duplicated a loop header once and cost a confusing build error.
+- Upstream tests encode upstream defaults. Where the fork deliberately differs,
+  update the test and say why in a comment rather than reverting the behaviour.

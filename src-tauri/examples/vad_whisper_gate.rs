@@ -13,8 +13,8 @@
 
 use anyhow::Result;
 use handy_app_lib::audio_toolkit::vad::{
-    SmoothedVad, VoiceActivityDetector, VAD_ONSET_FRAMES, VAD_PREFILL_FRAMES,
-    VAD_STREAMING_HANGOVER_FRAMES,
+    frames_for_duration_ms, SmoothedVad, VoiceActivityDetector, VAD_ONSET_MS, VAD_PREFILL_MS,
+    VAD_STREAMING_HANGOVER_MS,
 };
 use handy_app_lib::audio_toolkit::{vad::VadFrame, SileroVad};
 use std::path::Path;
@@ -62,11 +62,13 @@ fn main() -> Result<()> {
         let samples = read_wav(&path)?;
         // A fresh detector per clip: the recorder resets state per session.
         let silero = SileroVad::new(SILERO, VAD_THRESHOLD)?;
+        // Upstream now expresses these as durations and converts per frame size,
+        // so the harness must do the same to keep measuring the real gate.
         let mut vad: Box<dyn VoiceActivityDetector> = Box::new(SmoothedVad::new(
             Box::new(silero),
-            VAD_PREFILL_FRAMES,
-            VAD_STREAMING_HANGOVER_FRAMES,
-            VAD_ONSET_FRAMES,
+            frames_for_duration_ms(VAD_PREFILL_MS, FRAME),
+            frames_for_duration_ms(VAD_STREAMING_HANGOVER_MS, FRAME),
+            frames_for_duration_ms(VAD_ONSET_MS, FRAME),
         ));
 
         let (mut frames_in, mut frames_kept) = (0usize, 0usize);

@@ -197,7 +197,7 @@ fn main() -> Result<()> {
         Path::new(MODEL_PATH),
         &ModelOptions {
             backend: Backend::Metal,
-            gpu_device: 0,
+            device: None,
         },
     )?;
     let mut session = model.session()?;
