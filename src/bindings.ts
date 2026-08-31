@@ -383,6 +383,46 @@ async changeFillerWordRemovalEnabledSetting(enabled: boolean) : Promise<Result<n
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Persist the Gemini-specific block (mode, language hints, custom vocabulary,
+ * diarization, timestamps).
+ * 
+ * The settings card patches the whole struct rather than one field at a time,
+ * so this takes it whole. Without this command the card rendered, highlighted
+ * the option the user picked, and saved nothing: `settingUpdaters` had no
+ * entry for `gemini_transcribe`, so `updateSetting` fell through to its
+ * `console.warn` branch and the next refresh restored the stored value.
+ */
+async changeGeminiTranscribeSettings(config: GeminiTranscribeSettings) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("change_gemini_transcribe_settings", { config }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Replace the cloud provider API keys with the map the settings card holds.
+ * 
+ * Takes a plain map rather than `SecretMap`: that type is `pub(crate)` and has
+ * no business in a command signature. `DerefMut` gives the map underneath.
+ */
+async changeCloudApiKeys(keys: Partial<{ [key in string]: string }>) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("change_cloud_api_keys", { keys }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async changeShowLiveTranscriptSetting(enabled: boolean) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("change_show_live_transcript_setting", { enabled }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async changeAppLanguageSetting(language: string) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("change_app_language_setting", { language }) };

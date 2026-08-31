@@ -22,8 +22,8 @@ use tauri::{AppHandle, Emitter, Manager};
 use crate::settings::APPLE_INTELLIGENCE_DEFAULT_MODEL_ID;
 use crate::settings::{
     self, get_settings, AutoSubmitKey, ClipboardHandling, KeyboardImplementation, LLMPrompt,
-    OverlayPosition, OverlayStyle, PasteMethod, ShortcutActivation, ShortcutBinding, SoundTheme,
-    Theme, TypingTool, VadBackend, APPLE_INTELLIGENCE_PROVIDER_ID,
+    GeminiTranscribeSettings, OverlayPosition, OverlayStyle, PasteMethod, ShortcutActivation,
+    ShortcutBinding, SoundTheme, Theme, TypingTool, VadBackend, APPLE_INTELLIGENCE_PROVIDER_ID,
 };
 use crate::tray;
 
@@ -1336,6 +1336,55 @@ pub fn change_filler_word_removal_enabled_setting(
 ) -> Result<(), String> {
     let mut settings = settings::get_settings(&app);
     settings.filler_word_removal_enabled = enabled;
+    settings::write_settings(&app, settings);
+    Ok(())
+}
+
+/// Persist the Gemini-specific block (mode, language hints, custom vocabulary,
+/// diarization, timestamps).
+///
+/// The settings card patches the whole struct rather than one field at a time,
+/// so this takes it whole. Without this command the card rendered, highlighted
+/// the option the user picked, and saved nothing: `settingUpdaters` had no
+/// entry for `gemini_transcribe`, so `updateSetting` fell through to its
+/// `console.warn` branch and the next refresh restored the stored value.
+#[tauri::command]
+#[specta::specta]
+pub fn change_gemini_transcribe_settings(
+    app: AppHandle,
+    config: GeminiTranscribeSettings,
+) -> Result<(), String> {
+    let mut settings = settings::get_settings(&app);
+    settings.gemini_transcribe = config;
+    settings::write_settings(&app, settings);
+    Ok(())
+}
+
+/// Replace the cloud provider API keys with the map the settings card holds.
+///
+/// Takes a plain map rather than `SecretMap`: that type is `pub(crate)` and has
+/// no business in a command signature. `DerefMut` gives the map underneath.
+#[tauri::command]
+#[specta::specta]
+pub fn change_cloud_api_keys(
+    app: AppHandle,
+    keys: std::collections::HashMap<String, String>,
+) -> Result<(), String> {
+    let mut settings = settings::get_settings(&app);
+    settings.cloud_api_keys.clear();
+    settings.cloud_api_keys.extend(keys);
+    settings::write_settings(&app, settings);
+    Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn change_show_live_transcript_setting(
+    app: AppHandle,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut settings = settings::get_settings(&app);
+    settings.show_live_transcript = enabled;
     settings::write_settings(&app, settings);
     Ok(())
 }

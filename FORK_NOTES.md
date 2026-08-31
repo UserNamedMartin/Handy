@@ -171,7 +171,32 @@ sends raw dictation audio to a third party.
 
 Settings live in `GeminiTranscribeSettings` (mode / language_codes /
 custom_vocabulary / include_custom_words / diarization / timestamps) plus
-`cloud_api_keys: SecretMap`. The key may also come from `HANDY_GEMINI_API_KEY`
+`cloud_api_keys: SecretMap`. Each of these is persisted by a command of its
+own — `change_gemini_transcribe_settings`, `change_cloud_api_keys`,
+`change_show_live_transcript_setting` — registered in `collect_commands!` and
+wired into `settingUpdaters` in `src/stores/settingsStore.ts`.
+
+**A new settings key needs all three or it silently does nothing.** These three
+shipped in August with the UI card and *no* backend at all: `updateSetting` looks
+the key up in `settingUpdaters`, and on a miss it falls through to
+`console.warn("No handler for setting: ...")` — into the WebView console, which
+nobody has open. The card rendered, the button highlighted the mode you picked,
+React state updated optimistically, and the next refresh restored the stored
+value. It read as "the app keeps resetting my setting". Nothing in the type
+system catches this: `settingUpdaters` is `Partial<...>`, so a missing key is
+legal. If you add a field to `AppSettings` and expose it in the UI, add the
+command and the updater in the same commit, and change it once in the running
+app to confirm `settings_store.json` actually moves.
+
+**Use `verbatim`, not the `Smart` default, for dictating commentary.** Google's
+SMART mode "might slightly rewrite, omit, or rephrase" (their words, quoted at
+`GeminiTranscribeMode`), and on real dictations it does exactly that: it treats
+hedged framing as filler and deletes it. Measured against local whisper on the
+same audio, it turned "вот тут я бы сформулировал как, что типа ваш лучший
+сотрудник доступен 24 на 7 или что-то типа такого" into "Ваш лучший сотрудник
+доступен 24/7." — the comment about the slide became the slide's slogan. Direct
+speech survives SMART untouched; the damage lands precisely on thinking-out-loud,
+which is most of what dictation is for here. The key may also come from `HANDY_GEMINI_API_KEY`
 for headless runs; the stored setting wins. `custom_words_sent_to_model` now
 gates the fuzzy post-corrector — running it on top of `custom_vocabulary` would
 replace a term the model already got right with a near-miss from the same list.

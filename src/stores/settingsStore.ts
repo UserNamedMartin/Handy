@@ -8,6 +8,7 @@ import type {
   OrtAcceleratorSetting,
   ShortcutActivation,
   VadBackend,
+  GeminiTranscribeSettings,
 } from "@/bindings";
 import { commands } from "@/bindings";
 import { toast } from "sonner";
@@ -182,6 +183,12 @@ const settingUpdaters: {
   },
   filler_word_removal_enabled: (value) =>
     commands.changeFillerWordRemovalEnabledSetting(value as boolean),
+  gemini_transcribe: (value) =>
+    commands.changeGeminiTranscribeSettings(value as GeminiTranscribeSettings),
+  cloud_api_keys: (value) =>
+    commands.changeCloudApiKeys(value as Record<string, string>),
+  show_live_transcript: (value) =>
+    commands.changeShowLiveTranscriptSetting(value as boolean),
   show_tray_icon: (value) =>
     commands.changeShowTrayIconSetting(value as boolean),
   transcribe_accelerator: (value) =>
