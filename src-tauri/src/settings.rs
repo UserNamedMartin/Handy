@@ -630,6 +630,13 @@ fn default_settings_schema_version() -> u32 {
     CURRENT_SETTINGS_SCHEMA_VERSION
 }
 
+/// Binding ids this fork once shipped. Removing one from the defaults is not
+/// enough: existing stores keep their copy, and it would still grab the key.
+const RETIRED_BINDINGS: &[&str] = &[
+    // Replaced by the app-wide `shortcut_activation` + the `latch` binding.
+    "transcribe_toggle",
+];
+
 fn default_double_tap_window_ms() -> u64 {
     400
 }
@@ -1285,6 +1292,17 @@ fn apply_settings_migrations(
     // absent): the retired `push_to_talk` bool maps onto the two legacy modes so
     // upgrading users keep exactly the behavior they had. Only fresh installs
     // get the hold-or-toggle default.
+    // Bindings the fork used to ship and no longer does. A stored entry outlives
+    // the default that created it, and the shortcut backend registers whatever
+    // is in `bindings` — so a retired id keeps claiming its hotkey system-wide
+    // while having no action behind it, silently swallowing the key.
+    for retired in RETIRED_BINDINGS {
+        if settings.bindings.remove(*retired).is_some() {
+            log::info!("Dropping retired binding '{retired}' from settings");
+            updated = true;
+        }
+    }
+
     if settings_value.get("shortcut_activation").is_none() {
         // Fork stores also carry a per-binding `activation_mode`, which took
         // precedence over the global bool: `push_to_talk: true` alongside a
@@ -1751,6 +1769,30 @@ mod tests {
 
         assert!(apply_settings_migrations(&mut settings, &raw));
         assert_eq!(settings.shortcut_activation, ShortcutActivation::Toggle);
+    }
+
+    #[test]
+    fn retired_bindings_are_dropped_from_existing_stores() {
+        // A stored `transcribe_toggle` would still be registered as a global
+        // hotkey while having no action behind it — the key would do nothing
+        // anywhere on the system.
+        let mut settings = get_default_settings();
+        settings.bindings.insert(
+            "transcribe_toggle".to_string(),
+            ShortcutBinding {
+                id: "transcribe_toggle".to_string(),
+                name: "Transcribe (Toggle)".to_string(),
+                description: String::new(),
+                default_binding: "ctrl+option+space".to_string(),
+                current_binding: "ctrl+option+space".to_string(),
+            },
+        );
+
+        apply_settings_migrations(&mut settings, &serde_json::json!({}));
+
+        assert!(!settings.bindings.contains_key("transcribe_toggle"));
+        assert!(settings.bindings.contains_key("transcribe"));
+        assert!(settings.bindings.contains_key("latch"));
     }
 
     #[test]
