@@ -19,9 +19,27 @@ use transcribe_cpp::{
     Backend, Model, ModelOptions, RunExtension, RunOptions, Task, WhisperRunOptions,
 };
 
-const MODEL_PATH: &str = "/Users/martinmourzenkov/.cache/huggingface/hub/models--handy-computer--whisper-large-v3-gguf/snapshots/e3e29bee6389c7da4a141406f07bb80ddac5337c/whisper-large-v3-Q5_K_M.gguf";
-const RECORDINGS_DIR: &str =
-    "/Users/martinmourzenkov/Library/Application Support/com.pais.handy/recordings";
+/// Override with `MODEL_PATH=...`; the default resolves under `$HOME` so the
+/// harness is not tied to one machine's account name.
+fn model_path() -> String {
+    std::env::var("MODEL_PATH").unwrap_or_else(|_| {
+        format!(
+            "{}/.cache/huggingface/hub/models--handy-computer--whisper-large-v3-gguf/\
+             snapshots/e3e29bee6389c7da4a141406f07bb80ddac5337c/whisper-large-v3-Q5_K_M.gguf",
+            std::env::var("HOME").unwrap_or_default()
+        )
+    })
+}
+/// Relative to `$HOME`, resolved at use — see `recordings_dir()`.
+const RECORDINGS_DIR: &str = "Library/Application Support/com.pais.handy/recordings";
+
+fn recordings_dir() -> String {
+    format!(
+        "{}/{}",
+        std::env::var("HOME").unwrap_or_default(),
+        RECORDINGS_DIR
+    )
+}
 
 const PRIMER_RU: &str = "Привет! Давай обсудим план на сегодня. \
      Нужно закоммитить изменения, открыть pull request и смержить его в main. \
@@ -73,7 +91,7 @@ fn whisper_opts(primer: Option<&str>) -> RunOptions {
 fn main() -> Result<()> {
     eprintln!("loading model (metal)…");
     let model = Model::load_with(
-        Path::new(MODEL_PATH),
+        Path::new(&model_path()),
         &ModelOptions {
             backend: Backend::Metal,
             device: None,
@@ -81,7 +99,7 @@ fn main() -> Result<()> {
     )?;
     let mut session = model.session()?;
 
-    let mut wavs: Vec<_> = std::fs::read_dir(RECORDINGS_DIR)?
+    let mut wavs: Vec<_> = std::fs::read_dir(recordings_dir())?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().map(|x| x == "wav").unwrap_or(false))
         .collect();

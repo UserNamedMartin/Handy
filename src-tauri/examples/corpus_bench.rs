@@ -4,8 +4,8 @@
 //!
 //! Run from `src-tauri/`, configured via env vars:
 //!   MODEL_PATH=/abs/path/to/model.gguf \
-//!   CORPUS_DIR=/Users/martinmourzenkov/tools-for-agents/handy-eval/corpus \
-//!   OUT_PATH=/Users/martinmourzenkov/tools-for-agents/handy-eval/local_runs/<tag>.jsonl \
+//!   CORPUS_DIR=$HOME/tools-for-agents/handy-eval/corpus \
+//!   OUT_PATH=$HOME/tools-for-agents/handy-eval/local_runs/<tag>.jsonl \
 //!   PRIMER=""            # optional initial prompt (default none)
 //!   COND_PREV=false      # condition_on_prev_tokens (default false, matches fork)
 //!   cargo run --release --example corpus_bench
