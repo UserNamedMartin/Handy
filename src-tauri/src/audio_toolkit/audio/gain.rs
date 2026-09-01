@@ -23,18 +23,18 @@ pub const BOOST_TARGET_DBFS: f32 = -3.0;
 /// up) isn't amplified without bound.
 pub const MAX_BOOST_DB: f32 = 40.0;
 
-fn rms(samples: &[f32]) -> f32 {
+pub(super) fn rms(samples: &[f32]) -> f32 {
     if samples.is_empty() {
         return 0.0;
     }
     (samples.iter().map(|x| x * x).sum::<f32>() / samples.len() as f32).sqrt()
 }
 
-fn peak(samples: &[f32]) -> f32 {
+pub(super) fn peak(samples: &[f32]) -> f32 {
     samples.iter().fold(0.0f32, |m, x| m.max(x.abs()))
 }
 
-fn to_dbfs(amp: f32) -> f32 {
+pub(super) fn to_dbfs(amp: f32) -> f32 {
     if amp > 0.0 {
         20.0 * amp.log10()
     } else {

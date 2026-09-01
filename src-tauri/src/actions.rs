@@ -742,10 +742,28 @@ impl ShortcutAction for TranscribeAction {
                     return;
                 }
 
-                if samples.is_empty() {
-                    debug!("Recording produced no audio samples; skipping persistence");
+                // Ask the audio whether anyone spoke, before anything is sent
+                // anywhere. A timer cannot tell "nothing to say" from "the answer
+                // is late"; the waveform can, it costs nothing, and it is what
+                // Google's own Gemini dictation client does for the same reason.
+                // Every clause in the gate can only prevent a discard.
+                let speech = crate::audio_toolkit::classify_speech(
+                    &samples,
+                    crate::audio_toolkit::WHISPER_SAMPLE_RATE,
+                );
+                if samples.is_empty() || !speech.is_speech() {
+                    if samples.is_empty() {
+                        debug!("Recording produced no audio samples; skipping persistence");
+                    } else {
+                        debug!(
+                            "Nothing was said ({:?}); skipping transcription entirely",
+                            speech
+                        );
+                    }
                     // Tear down any streaming worker so its channel doesn't leak
-                    // and block the next start_stream.
+                    // and block the next start_stream. For a no-speech recording
+                    // this is also what makes it free: the socket is abandoned
+                    // instead of being finalized and waited on.
                     tm.cancel_stream();
                     utils::hide_recording_overlay(&ah);
                     set_tray_state(&ah, TrayIconState::Idle);
@@ -774,7 +792,12 @@ impl ShortcutAction for TranscribeAction {
                         // surfaced instead: the worker may still hold the engine,
                         // so a batch fallback would contend with it.
                         Ok(StreamOutcome::Text(text)) => Ok(text),
-                        Ok(StreamOutcome::Silent) => Ok(String::new()),
+                        // The gate above already ruled there is speech in this
+                        // audio, so a stream that heard nothing dropped the
+                        // transcript. That is a failure worth retrying, not
+                        // silence — which is why the wait timer no longer decides
+                        // anything a discard depends on.
+                        Ok(StreamOutcome::Silent) => tm.transcribe(samples),
                         Ok(StreamOutcome::UseBatch) => tm.transcribe(samples),
                         Err(err) => Err(err),
                     };
