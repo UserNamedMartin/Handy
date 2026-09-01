@@ -191,6 +191,13 @@ enum Effect {
         binding_id: String,
         hotkey_string: String,
     },
+    /// Throw the recording away without transcribing it. Distinct from `Stop`,
+    /// which hands the audio to the pipeline: a discarded recording produces no
+    /// text, costs no cloud request, and leaves the coordinator idle
+    /// immediately rather than parked in `Processing`.
+    Discard {
+        binding_id: String,
+    },
 }
 
 /// Commands processed sequentially by the coordinator thread.
@@ -287,16 +294,32 @@ impl CoordinatorState {
     }
 
     /// The double-tap window closed with no second press: it was a lone tap,
-    /// which by design does nothing — so stop the recording it opened.
+    /// which by design does nothing — so throw away the recording it opened.
+    ///
+    /// This used to `begin_processing`, i.e. transcribe it. A lone tap is a
+    /// brush against the `fn` key, so that fed ~150-400 ms of room tone to the
+    /// engine and, on a cloud streaming model, cost about ten seconds: ~0.7 s to
+    /// raise the socket, then the full `TAIL_FIRST_WAIT` (6 s) waiting for a
+    /// transcript chunk that never comes for noise, then an empty result falling
+    /// back to batch and its ~3 s floor. The coordinator sat in `Processing` for
+    /// all of it, so every keypress in that window was refused as "pipeline
+    /// busy" — the app looked wedged after an accidental touch.
     fn on_tap_expired(&mut self) -> Option<Effect> {
         let tap = self.pending_tap.take()?;
         match &self.stage {
             Stage::Recording(id) if *id == tap.binding_id => {
                 debug!(
-                    "Lone tap for '{}': no second press inside the window",
+                    "Lone tap for '{}': no second press inside the window, discarding",
                     tap.binding_id
                 );
-                Some(self.begin_processing(tap.binding_id, tap.hotkey_string))
+                // Straight back to Idle: nothing enters the pipeline, so no
+                // `ProcessingFinished` is coming to release the stage, and the
+                // next press must be accepted immediately.
+                self.stage = Stage::Idle;
+                self.hold = None;
+                Some(Effect::Discard {
+                    binding_id: tap.binding_id,
+                })
             }
             _ => None,
         }
@@ -816,6 +839,10 @@ fn run_effect(app: &AppHandle, state: &mut CoordinatorState, effect: Effect) {
             binding_id,
             hotkey_string,
         } => stop(app, &binding_id, &hotkey_string),
+        Effect::Discard { binding_id } => {
+            debug!("Discarding recording for '{binding_id}' without transcribing");
+            crate::utils::discard_current_operation(app, "discarded recording");
+        }
     }
 }
 
@@ -1056,6 +1083,10 @@ mod tests {
             match effect {
                 Some(Effect::Start { .. }) => starts += 1,
                 Some(Effect::Stop { .. }) => stops += 1,
+                // Only the lone-tap window discards, and push-to-talk has no
+                // such window. Assert rather than swallow: a discard here would
+                // make the start/stop counts quietly wrong.
+                Some(Effect::Discard { .. }) => unreachable!("push-to-talk never discards"),
                 None => {}
             }
         }
@@ -1389,8 +1420,6 @@ mod tests {
         assert_eq!(state.stage, Stage::Processing);
     }
 
-    /// Hold-or-toggle: a tap keeps recording (locked on); the next press stops.
-    #[test]
     // ---- Fork mode: HoldOrDoubleTap --------------------------------------
     // Hold to talk; a LONE tap does nothing; a DOUBLE tap locks recording on.
     // These three properties are the whole point of the variant, so each gets
@@ -1425,10 +1454,38 @@ mod tests {
         assert!(!state.is_locked(), "a lone tap must not lock recording on");
         assert!(state.tap_deadline().is_some());
 
-        // Nobody taps again, so the window closes and the recording ends.
-        assert!(matches!(state.on_tap_expired(), Some(Effect::Stop { .. })));
-        assert_eq!(state.stage, Stage::Processing);
+        // Nobody taps again, so the window closes and the recording is thrown
+        // away — not transcribed. A brush against `fn` must cost nothing.
+        assert!(matches!(
+            state.on_tap_expired(),
+            Some(Effect::Discard { .. })
+        ));
+        // Idle, not Processing: no pipeline runs, so nothing will send
+        // ProcessingFinished, and the very next press must be accepted.
+        assert_eq!(state.stage, Stage::Idle);
         assert!(state.tap_deadline().is_none());
+    }
+
+    /// The lockout this fixes: while the lone tap's audio was being transcribed
+    /// the coordinator sat in `Processing` and refused every press.
+    #[test]
+    fn hold_or_double_tap_lone_tap_leaves_the_next_press_usable() {
+        let mode = ShortcutActivation::HoldOrDoubleTap;
+        let mut state = CoordinatorState::new();
+        let t0 = Instant::now();
+
+        state.on_input(input(mode, true), t0);
+        state.on_input(input(mode, false), t0 + ms(120));
+        state.on_grace_expired();
+        state.on_tap_expired();
+
+        // No on_processing_finished() in between — there is no pipeline to
+        // drain. The next press starts a recording straight away.
+        assert!(matches!(
+            state.on_input(input(mode, true), t0 + ms(600)),
+            Some(Effect::Start { .. })
+        ));
+        assert_eq!(state.stage, Stage::Recording(BINDING.to_string()));
     }
 
     #[test]
@@ -1466,10 +1523,12 @@ mod tests {
         state.on_input(input(mode, true), t0);
         state.on_input(input(mode, false), t0 + ms(120));
         state.on_grace_expired();
-        // Window closed first: the lone tap already stopped the recording, so a
+        // Window closed first: the lone tap already discarded the recording, so a
         // press this late is a fresh start, not a latch.
-        assert!(matches!(state.on_tap_expired(), Some(Effect::Stop { .. })));
-        state.on_processing_finished();
+        assert!(matches!(
+            state.on_tap_expired(),
+            Some(Effect::Discard { .. })
+        ));
         assert!(matches!(
             state.on_input(input(mode, true), t0 + ms(2000)),
             Some(Effect::Start { .. })

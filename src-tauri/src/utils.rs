@@ -82,10 +82,14 @@ fn native_windows_machine() -> Option<u16> {
 }
 
 /// Centralized cancellation function that can be called from anywhere in the app.
-/// Handles cancelling both recording and transcription operations and updates UI state.
-pub fn cancel_current_operation(app: &AppHandle) {
-    info!("Initiating operation cancellation...");
-
+/// Throw away a live recording and any streaming transcription, and put the UI
+/// back to idle. Returns whether a recording was actually running.
+///
+/// Split out of [`cancel_current_operation`] because the coordinator needs the
+/// teardown *without* the notification: when it discards a recording it is the
+/// one deciding, so calling back into `notify_cancel` from inside its own event
+/// loop would be re-entrant.
+pub fn discard_current_operation(app: &AppHandle, reason: &str) -> bool {
     // Unregister the cancel + hands-free latch shortcuts asynchronously
     shortcut::unregister_cancel_shortcut(app);
     shortcut::unregister_latch_shortcut(app);
@@ -104,7 +108,16 @@ pub fn cancel_current_operation(app: &AppHandle) {
     hide_recording_overlay(app);
 
     // Unload model if immediate unload is enabled
-    tm.maybe_unload_immediately("cancellation");
+    tm.maybe_unload_immediately(reason);
+
+    recording_was_active
+}
+
+/// Handles cancelling both recording and transcription operations and updates UI state.
+pub fn cancel_current_operation(app: &AppHandle) {
+    info!("Initiating operation cancellation...");
+
+    let recording_was_active = discard_current_operation(app, "cancellation");
 
     // Notify coordinator so it can keep lifecycle state coherent.
     if let Some(coordinator) = app.try_state::<TranscriptionCoordinator>() {
