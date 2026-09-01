@@ -36,7 +36,7 @@ use env_filter::Builder as EnvFilterBuilder;
 use managers::audio::AudioRecordingManager;
 use managers::history::HistoryManager;
 use managers::model::ModelManager;
-use managers::transcription::TranscriptionManager;
+use managers::transcription::{StreamOutcome, TranscriptionManager};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use tauri::image::Image;
@@ -582,8 +582,11 @@ fn run_headless_transcription(app: &AppHandle, args: &CliArgs) -> i32 {
         // Exercising it here is the point — a broken fallback is what turned a
         // dead socket into a lost dictation.
         let (text, source) = match streamed {
-            Ok(Some(t)) if !t.trim().is_empty() => (t, "stream"),
-            Ok(_) => match tm.transcribe(samples.clone()) {
+            Ok(StreamOutcome::Text(t)) => (t, "stream"),
+            // A healthy session that heard nothing. Reported distinctly so a
+            // --stream run over silence is not mistaken for a broken socket.
+            Ok(StreamOutcome::Silent) => (String::new(), "stream-silent"),
+            Ok(StreamOutcome::UseBatch) => match tm.transcribe(samples.clone()) {
                 Ok(t) => (t, "batch-fallback"),
                 Err(e) => {
                     eprintln!("error: stream produced nothing and batch fallback failed: {}", e);

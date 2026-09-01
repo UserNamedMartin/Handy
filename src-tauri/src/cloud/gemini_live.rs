@@ -59,7 +59,7 @@ const FINAL_WAIT: Duration = Duration::from_secs(10);
 /// Backstop between tail chunks when no end-of-turn signal lands.
 const IDLE_AFTER_FINAL: Duration = Duration::from_millis(600);
 
-/// How long to wait for the first transcript chunk after `activityEnd`.
+/// Ceiling on the wait for the first transcript chunk after `activityEnd`.
 ///
 /// With manual activity detection the server emits nothing until the turn
 /// closes, so this is the whole transcript's latency, not a tail: measured 316 ms
@@ -67,6 +67,26 @@ const IDLE_AFTER_FINAL: Duration = Duration::from_millis(600);
 /// against that curve because overshooting merely delays, while undershooting
 /// discards a finished transcript. Matches Jot's `TimeoutPolicy.liveFinal`.
 const TAIL_FIRST_WAIT: Duration = Duration::from_secs(6);
+
+/// Floor under [`tail_first_wait`], covering the round trip itself.
+const TAIL_WAIT_FLOOR: Duration = Duration::from_millis(800);
+
+/// How much of the ceiling a second of audio earns. 40 ms/s sits ~3x above the
+/// measured curve at every length, so the bound stays conservative.
+const TAIL_WAIT_PER_AUDIO_SECOND: f64 = 0.04;
+
+/// How long to wait for the first chunk, given how much audio was actually sent.
+///
+/// A flat ceiling is calibrated for the longest dictation and is absurd for the
+/// shortest: a key brushed for 250 ms produced no speech, so the service will
+/// never send a chunk, and waiting the full 6 s for one blocked the whole
+/// pipeline behind an accident. The transcript cannot outlast its audio, so the
+/// budget scales with it and only ever shortens the wait — long dictations still
+/// get the full ceiling.
+pub fn tail_first_wait(audio: Duration) -> Duration {
+    let scaled = TAIL_WAIT_FLOOR + audio.mul_f64(TAIL_WAIT_PER_AUDIO_SECOND);
+    scaled.min(TAIL_FIRST_WAIT)
+}
 
 /// Absolute ceiling on a session, generous against Google's own 10-minute cap.
 /// A socket that goes quiet mid-dictation must not strand the thread.
@@ -169,7 +189,7 @@ impl GeminiLiveSession {
     ///
     /// Returns every finalized chunk seen after this point; the caller joins
     /// them onto whatever it already collected from [`poll`].
-    pub fn finish(&mut self, timeout: Duration) -> Result<Vec<String>> {
+    pub fn finish(&mut self, timeout: Duration, first_wait: Duration) -> Result<Vec<String>> {
         if let Some(tx) = &self.audio_tx {
             let _ = tx.send(Outbound::End);
         }
@@ -186,7 +206,7 @@ impl GeminiLiveSession {
             // the ceiling — reaching it means something is wrong, not that we
             // are being patient.
             let wait = if tail.is_empty() {
-                hard_remaining.min(TAIL_FIRST_WAIT)
+                hard_remaining.min(first_wait)
             } else {
                 hard_remaining.min(IDLE_AFTER_FINAL)
             };
@@ -508,6 +528,32 @@ fn truncate(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A quarter-second brush against the key cannot have a transcript pending,
+    /// so it must not buy the full ceiling — that six-second wait is what left
+    /// the pipeline busy, and the app unusable, after an accident.
+    #[test]
+    fn tail_first_wait_shrinks_for_clips_too_short_to_have_a_transcript() {
+        let brushed = tail_first_wait(Duration::from_millis(250));
+        assert!(brushed < Duration::from_secs(1), "{brushed:?}");
+        assert!(brushed >= TAIL_WAIT_FLOOR, "{brushed:?}");
+    }
+
+    /// Only ever shortens: a long dictation still gets the full, conservative
+    /// ceiling, because undershooting there discards a finished transcript.
+    #[test]
+    fn tail_first_wait_keeps_the_ceiling_for_long_dictations() {
+        assert_eq!(tail_first_wait(Duration::from_secs(142)), TAIL_FIRST_WAIT);
+        assert_eq!(tail_first_wait(Duration::from_secs(600)), TAIL_FIRST_WAIT);
+    }
+
+    /// Comfortably above every measured latency on the curve (316 ms at 3 s,
+    /// 1.2 s at 90 s), so the shortening never races a real transcript.
+    #[test]
+    fn tail_first_wait_stays_above_the_measured_latency_curve() {
+        assert!(tail_first_wait(Duration::from_secs(3)) > Duration::from_millis(316));
+        assert!(tail_first_wait(Duration::from_secs(90)) > Duration::from_millis(1200));
+    }
 
     #[test]
     fn finals_join_with_a_single_space() {

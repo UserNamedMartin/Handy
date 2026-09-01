@@ -5,7 +5,7 @@ use crate::audio_toolkit::{
 };
 use crate::managers::audio::AudioRecordingManager;
 use crate::cloud::gemini::GeminiTranscriber;
-use crate::cloud::gemini_live::{join_finals, GeminiLiveSession, LiveEvent};
+use crate::cloud::gemini_live::{join_finals, tail_first_wait, GeminiLiveSession, LiveEvent};
 use crate::managers::model::{EngineType, ModelManager};
 use crate::settings::{
     get_settings, AppSettings, ModelUnloadTimeout, OrtAcceleratorSetting,
@@ -172,11 +172,29 @@ enum StreamCmd {
     Cancel,
 }
 
+/// What [`TranscriptionManager::finalize_stream`] produced, phrased as what the
+/// caller should do next.
+pub enum StreamOutcome {
+    /// Usable text from the stream — use it.
+    Text(String),
+    /// The stream ran cleanly and heard nothing. The recording is genuinely
+    /// empty; do not batch-transcribe it.
+    Silent,
+    /// No stream ran, or it broke. Batch-transcribe the audio instead.
+    UseBatch,
+}
+
 struct FinalizedStreamText {
     text: String,
     output_language: OutputLanguageEvidence,
     /// The streaming model's supported languages, for text-based detection.
     supported_languages: Vec<String>,
+    /// The session ran to completion and there was simply nothing to
+    /// transcribe — silence, or a key brushed. Distinct from an empty result
+    /// caused by a broken session: batch would hand the same silence to the
+    /// same provider for the same nothing, costing another ~3 s and another
+    /// billed request.
+    nothing_said: bool,
 }
 
 /// Routes real-time audio frames to the active streaming worker. Shared between
@@ -1146,6 +1164,7 @@ impl TranscriptionManager {
                                     resolved => resolved.clone(),
                                 };
                                 Some(FinalizedStreamText {
+                                    nothing_said: false,
                                     text: stream.text().full,
                                     output_language,
                                     supported_languages: languages.clone(),
@@ -1409,24 +1428,23 @@ impl TranscriptionManager {
         }
     }
 
-    /// Flush the active stream and return its final, post-filtered text.
+    /// Flush the active stream and say what the caller should do with the result.
     ///
-    /// `Ok(None)` means no usable stream was active and the caller may fall back
-    /// to batch transcription. `Err` means finalize itself failed or timed out.
-    /// A timeout may still leave the worker holding the engine, so callers
-    /// should surface it instead of immediately starting a batch fallback.
-    pub fn finalize_stream(&self) -> Result<Option<String>> {
+    /// `Err` means finalize itself failed or timed out. A timeout may still
+    /// leave the worker holding the engine, so callers should surface it instead
+    /// of immediately starting a batch fallback.
+    pub fn finalize_stream(&self) -> Result<StreamOutcome> {
         let Some(tx) = self.router.take() else {
-            return Ok(None);
+            return Ok(StreamOutcome::UseBatch);
         };
         let (reply_tx, reply_rx) = mpsc::channel();
         if tx.send(StreamCmd::Finalize(reply_tx)).is_err() {
-            return Ok(None);
+            return Ok(StreamOutcome::UseBatch);
         }
         let finalized = match reply_rx.recv_timeout(STREAM_FINALIZE_REPLY_TIMEOUT) {
             Ok(Some(finalized)) => finalized,
-            Ok(None) => return Ok(None),
-            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(None),
+            Ok(None) => return Ok(StreamOutcome::UseBatch),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(StreamOutcome::UseBatch),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 self.stream_active.store(false, Ordering::Release);
                 return Err(anyhow::anyhow!(
@@ -1435,6 +1453,13 @@ impl TranscriptionManager {
                 ));
             }
         };
+
+        if finalized.nothing_said {
+            // Healthy session, no speech in it. There is nothing for batch to
+            // find either, so end here instead of paying for a second look.
+            self.maybe_unload_immediately("streaming transcription");
+            return Ok(StreamOutcome::Silent);
+        }
 
         let settings = get_settings(&self.app_handle);
         // Streaming models do not receive a decode prompt, so custom words
@@ -1448,7 +1473,12 @@ impl TranscriptionManager {
         );
 
         self.maybe_unload_immediately("streaming transcription");
-        Ok(Some(filtered))
+        if filtered.trim().is_empty() {
+            // Post-filtering ate everything the stream produced; treat it the
+            // way an empty stream has always been treated.
+            return Ok(StreamOutcome::UseBatch);
+        }
+        Ok(StreamOutcome::Text(filtered))
     }
 
     /// Abandon any active stream without producing text (e.g. on cancel).
@@ -1540,19 +1570,27 @@ impl TranscriptionManager {
             }
         };
 
+        // How much audio actually reached the socket. The tail wait is scaled to
+        // it: a transcript cannot outlast its audio, and a quarter second of a
+        // brushed key must not buy a six-second wait for a chunk that is never
+        // coming.
+        let mut fed_samples: usize = 0;
+
         loop {
             match rx.recv() {
                 Ok(StreamCmd::Feed(pcm)) => {
                     self.touch_activity();
+                    fed_samples += pcm.len();
                     session.feed(&pcm);
                     absorb(session.poll(), &mut finals, &mut tentative, &mut failed);
                     self.emit_stream_text(&join_finals(&finals), &tentative);
                 }
                 Ok(StreamCmd::Finalize(reply)) => {
                     self.emit_stream_working(StreamWorkKind::Transcribing);
+                    let fed = Duration::from_secs_f64(fed_samples as f64 / 16_000.0);
                     // Everything before the release is already transcribed; only
                     // the tail is outstanding here (measured 220-500 ms).
-                    match session.finish(Duration::from_secs(20)) {
+                    match session.finish(Duration::from_secs(20), tail_first_wait(fed)) {
                         Ok(tail) => finals.extend(tail),
                         Err(e) => {
                             warn!("Gemini Live: finalize failed: {}", e);
@@ -1561,17 +1599,17 @@ impl TranscriptionManager {
                     }
                     let text = join_finals(&finals);
                     info!(
-                        "Gemini Live: {} chunk(s), {} chars{}",
+                        "Gemini Live: {} chunk(s), {} chars for {:.2}s of audio{}",
                         finals.len(),
                         text.len(),
+                        fed.as_secs_f64(),
                         if failed { " (session reported an error)" } else { "" }
                     );
-                    // An empty result means the caller batch-transcribes the same
-                    // audio, so a dead socket costs latency, never the dictation.
                     // The cloud model detects the language itself and reports
                     // none back, so the transcript is all the evidence there is.
-                    let _ = reply.send(stream_reply(
+                    let _ = reply.send(stream_outcome(
                         text,
+                        failed,
                         OutputLanguageEvidence::Unknown,
                         Vec::new(),
                     ));
@@ -2349,6 +2387,37 @@ fn stream_reply(
         text,
         output_language,
         supported_languages,
+        nothing_said: false,
+    })
+}
+
+/// Like [`stream_reply`], but for a backend that can tell a broken session from
+/// a healthy one that simply heard nothing.
+///
+/// Empty-means-batch is the right default when "empty" can only mean "the stream
+/// broke". For a cloud session it cannot: hold the key for a moment without
+/// speaking and the service correctly returns nothing. Re-sending that silence
+/// to the same provider bought a second helping of nothing for ~3 s and one more
+/// billed request, while the pipeline stayed busy and the app refused every
+/// keypress. Only a session that actually failed earns the fallback.
+fn stream_outcome(
+    text: String,
+    failed: bool,
+    output_language: OutputLanguageEvidence,
+    supported_languages: Vec<String>,
+) -> Option<FinalizedStreamText> {
+    if !text.trim().is_empty() {
+        return stream_reply(text, output_language, supported_languages);
+    }
+    if failed {
+        // Broken session: its emptiness proves nothing about the audio.
+        return None;
+    }
+    Some(FinalizedStreamText {
+        text: String::new(),
+        output_language,
+        supported_languages,
+        nothing_said: true,
     })
 }
 
@@ -2722,6 +2791,59 @@ mod tests {
         assert!(nothing(""));
         assert!(nothing("   "));
         assert!(nothing("\n\t "));
+    }
+
+    /// The root of "an empty recording wedges the app": a healthy session that
+    /// heard nothing must not send the same silence to batch for a second
+    /// helping of nothing.
+    #[test]
+    fn stream_outcome_does_not_batch_a_healthy_silence() {
+        let outcome = stream_outcome(
+            String::new(),
+            false,
+            OutputLanguageEvidence::Unknown,
+            Vec::new(),
+        )
+        .expect("a healthy silent session must not ask for batch");
+        assert!(outcome.nothing_said);
+        assert!(outcome.text.is_empty());
+    }
+
+    /// A broken session proves nothing about the audio, so its emptiness still
+    /// earns the batch fallback — that is what keeps a dead socket from costing
+    /// the dictation.
+    #[test]
+    fn stream_outcome_still_batches_a_broken_session() {
+        assert!(stream_outcome(
+            String::new(),
+            true,
+            OutputLanguageEvidence::Unknown,
+            Vec::new(),
+        )
+        .is_none());
+        assert!(stream_outcome(
+            "   ".to_string(),
+            true,
+            OutputLanguageEvidence::Unknown,
+            Vec::new(),
+        )
+        .is_none());
+    }
+
+    /// Text is text regardless of how the session ended.
+    #[test]
+    fn stream_outcome_keeps_text_from_either_kind_of_session() {
+        for failed in [false, true] {
+            let outcome = stream_outcome(
+                "Привет".to_string(),
+                failed,
+                OutputLanguageEvidence::Unknown,
+                Vec::new(),
+            )
+            .expect("real text is never a fallback");
+            assert_eq!(outcome.text, "Привет");
+            assert!(!outcome.nothing_said);
+        }
     }
 
     #[test]

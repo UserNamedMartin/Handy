@@ -5,7 +5,7 @@ use crate::audio_toolkit::{is_microphone_access_denied, is_no_input_device_error
 use crate::managers::audio::AudioRecordingManager;
 use crate::managers::history::HistoryManager;
 use crate::managers::model::ModelManager;
-use crate::managers::transcription::StreamWorkKind;
+use crate::managers::transcription::{StreamOutcome, StreamWorkKind};
 use crate::managers::transcription::TranscriptionManager;
 use crate::settings::{get_settings, AppSettings, OverlayStyle, APPLE_INTELLIGENCE_PROVIDER_ID};
 use crate::shortcut;
@@ -764,15 +764,18 @@ impl ShortcutAction for TranscribeAction {
                     // running, finalize it and use its text (all audio was already
                     // fed to the stream); otherwise batch-transcribe the samples.
                     let transcription_time = Instant::now();
-                    let transcription_result = match tm.finalize_stream() {
-                        // A finalized stream with usable text wins. An empty result
-                        // (no active stream, produced nothing, or a finalize error
-                        // after the engine was returned) falls back to a full batch
-                        // transcription of the same audio. A finalize timeout is
-                        // surfaced instead — the worker may still hold the engine,
+    let transcription_result = match tm.finalize_stream() {
+                        // Usable text wins. `UseBatch` (no active stream, or one
+                        // that broke) re-does the same audio in batch, so a dead
+                        // socket costs latency rather than the dictation.
+                        // `Silent` is a healthy session that heard nothing —
+                        // batch would find nothing too, so it ends here and the
+                        // pipeline frees immediately. A finalize timeout is
+                        // surfaced instead: the worker may still hold the engine,
                         // so a batch fallback would contend with it.
-                        Ok(Some(text)) if !text.trim().is_empty() => Ok(text),
-                        Ok(_) => tm.transcribe(samples),
+                        Ok(StreamOutcome::Text(text)) => Ok(text),
+                        Ok(StreamOutcome::Silent) => Ok(String::new()),
+                        Ok(StreamOutcome::UseBatch) => tm.transcribe(samples),
                         Err(err) => Err(err),
                     };
 
