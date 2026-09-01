@@ -54,12 +54,23 @@ Where the variant lives (keep these together if you extend it):
   (they already defer a release by a grace window to absorb X11 auto-repeat);
   `next_deadline()` sleeps until whichever timer lands first. `Command::Latch` →
   `on_latch()` sets the same `locked` flag a double tap sets.
+  **A lone tap resolves to `Effect::Discard`, not `Stop`.** The doc comment said
+  "does nothing" while the code called `begin_processing`, i.e. transcribed the
+  ~150-400 ms of room tone a brushed `fn` key had just recorded. `Effect` only
+  had `Start` and `Stop`, so the state machine's only way to end a recording was
+  to transcribe it; `Discard` throws the audio away and goes straight to `Idle`
+  (no pipeline runs, so no `ProcessingFinished` is coming to release the stage).
+  It executes through `utils::discard_current_operation`, which is
+  `cancel_current_operation` minus the notification — the coordinator is already
+  the one deciding, so calling back into `notify_cancel` from inside its own
+  event loop would be re-entrant.
 - `shortcut/handler.rs` — routes the `latch` binding to `notify_latch()`.
 
-Eight unit tests cover the variant and the latch: long hold stops, lone tap
-starts nothing lasting, second tap locks, a late second tap does not, latch
-locks a live hold, cancel clears a pending window, and `next_deadline` picks the
-nearer timer. Upstream's 36 coordinator tests still pass unchanged.
+Unit tests cover the variant and the latch: long hold stops, a lone tap starts
+nothing lasting *and* leaves the next press usable, second tap locks, a late
+second tap does not, latch locks a live hold, cancel clears a pending window, and
+`next_deadline` picks the nearer timer. Upstream's coordinator tests still pass
+unchanged.
 
 ### Other local fixes
 - **Fullscreen-aware overlay position** (`src-tauri/src/overlay.rs`): the bottom anchor used only macOS `work_area`, which a background app is handed as the *desktop's* Dock-reserved frame even when another app is in fullscreen — so the pill floated up "as if the Dock were there." Fixed with `dock_state::dock_is_on_screen()` (hand-declared `CGWindowList` + `core-foundation` externs): ask the window server directly whether the Dock's tile-bar window (owner `"Dock"`, layer 20 = `kCGDockWindowLevel`) is currently on screen. No Dock on screen (fullscreen space or auto-hidden) → anchor to the physical screen bottom; Dock on screen → above it via `work_area`. This is **app-agnostic** — an earlier attempt used the Accessibility `AXFullScreen` attribute, which works for native apps but NOT Electron apps (Claude, ChatGPT), so their fullscreen still floated high; the CGWindowList check works for all. No screen-recording permission needed (metadata only). Added dep: `core-foundation` (macOS).
@@ -84,14 +95,25 @@ nearer timer. Upstream's 36 coordinator tests still pass unchanged.
   envelope now sits on a wider input range, so the gain constants may want
   re-tuning — check the bars before trusting them.
 - **Cancel ✕ drawn as CSS bars** (`RecordingOverlay.css` `.sx::before`/`::after`; the `.tsx` cancel button is now empty): the sub-sized inline `<svg>` glyph rendered visibly off-centre inside the round button in the overlay WebView (it was fine in a normal browser). Two absolutely-centred pseudo-element bars (`translate(-50%,-50%)` + `rotate(±45deg)`) centre the ✕ on the button's own centre, so it can't drift regardless of svg rendering.
-- **Overlay window sized to the card** (`src-tauri/src/overlay.rs`): the overlay
-  window is not just a canvas — it swallows every click inside it, so slack
-  beyond the pill is dead space over whatever sits underneath. `OVERLAY_WIDTH` /
-  `OVERLAY_HEIGHT` still described the pre-"Tiny" pill (172/216 wide, 40 tall)
-  long after the CSS moved to 92/132 wide and 24 tall, leaving ~80 px of
-  click-eating margin either side — and 400x120 in streaming mode, around a
-  110 px card. **Keep these in sync with the `--ov-*` vars in
-  RecordingOverlay.css**; nothing enforces it.
+- **Overlay window tracks the card each state draws** (`src-tauri/src/overlay.rs`,
+  `overlay_dimensions`): the overlay window is not just a canvas — it swallows
+  every click inside it (there is no `ignore_cursor_events` anywhere), so every
+  pixel beyond the card is invisible dead space over whatever sits underneath.
+  Sizing one window for the widest state is not enough: the pill rests at 92
+  (`--ov-rest-w`) and only reaches 132 (`--ov-work-w`) while transcribing, so a
+  fixed 144-wide window left ~26 px of click-eating margin either side for the
+  whole time you are speaking, plus 10 px above. The window is now 94x26 while
+  listening and 134x26 while working — dead margin 1 px a side, which is a
+  rounding guard, not slack. Safe because the grow happens on a state change,
+  which resizes the window before the CSS width transition runs; and position
+  needs no work, since `y = bottom - height - OFFSET` anchors by the bottom edge
+  and the card is CSS-flush to it. **Keep the constants in sync with the `--ov-*`
+  vars in RecordingOverlay.css** — still nothing enforces it. Verified against
+  the running app with CGWindowList rather than by eye; that is the only way to
+  see this class of bug, because the dead area is invisible by definition.
+  **Still oversized:** the Live panel with live text on stays 400x120, because it
+  opens from text arriving rather than from a state change, so Rust never gets to
+  grow the window first.
 - **Whisper auto-gain — quiet/whispered speech now transcribes** (`src-tauri/src/audio_toolkit/audio/gain.rs` + `recorder.rs`): whispered dictation used to come back empty. Measured cause (harnesses below): the Whisper model handles quiet speech fine, but a whisper sits ~15 dB below normal voice (~−54 vs ~−39 dBFS RMS) and the **Silero VAD gate drops it** before it reaches Whisper — end-to-end WER was 41% (natural whisper) / 98% (faint), vs ~5% for normal voice. Fix: `whisper_autogain()` **conditionally** boosts an utterance — if its RMS is below `WHISPER_LEVEL_DBFS` (−45) it's treated as a whisper and peak-normalized to `BOOST_TARGET_DBFS` (−3, clip-safe, capped at `MAX_BOOST_DB`); at or above that it's normal voice and returned **bit-identical**. So it's **always-on, no mode to toggle** (matches Wispr Flow's "just speak quietly"). Applied in the recorder's **offline path only**: `run_consumer` buffers raw frames when `offline_autogain` is set (whole-utterance level is needed to decide the boost) and runs auto-gain → VAD at stop via `autogain_then_vad`. Result on Martin's recordings: natural whisper 41%→5% WER, faint 98%→~11%, normal voice untouched. Stress-tested: robust to background noise (pink/hum/babble at SNR 5–10 dB → 7–22% WER); no hallucination on boosted non-speech (Silero rejects even loud non-speech). **Not yet covered:** the streaming VAD path (Parakeet-style models) — would need a running AGC; and the boost is disabled there (offline only). Toggle via `AudioRecorder::with_whisper_autogain(false)` if ever needed.
 
 - **Debug capture — rich per-dictation logging** (`src-tauri/src/debug_capture.rs`, `recorder.rs`, `actions.rs`, `settings.rs`): **on by default** (`debug_capture` setting; `debug_capture_limit` = 200). Every dictation writes `~/Library/Application Support/com.pais.handy/debug/<timestamp>/`:
@@ -200,6 +222,105 @@ which is most of what dictation is for here. The key may also come from `HANDY_G
 for headless runs; the stored setting wins. `custom_words_sent_to_model` now
 gates the fuzzy post-corrector — running it on top of `custom_vocabulary` would
 replace a term the model already got right with a near-miss from the same list.
+
+### Reference: Google's own Gemini dictation client
+`google-gemini/jot-gemini-transcribe-macOS` ("Jot") is an open-source macOS
+dictation app built by Google against these same models. **Read it before
+designing anything in this area** — it is the only place where the intended
+behaviour of the Live API is written down by people who can see the server. Two
+of its ideas are now in this fork (the energy gate below, and `TimeoutPolicy`'s
+shape), and the rest is worth knowing about:
+
+- `DictationCoordinator` — the energy gates and the empty-transcript
+  classification, both described below.
+- `NoiseFloorEstimator` — "did they speak?" asked **relative to the room**, not
+  against a constant that assumes a quiet one.
+- `TimeoutPolicy` — every network deadline in one file, with reasons. Its
+  `liveFinal` is a flat 6 s and stays flat on purpose: "the alternative is not an
+  error, it is re-uploading audio we already streamed".
+- `ValidationGate` — they do **two** calls, raw transcribe plus cleanup, then
+  check the cleaned text against the raw one (containment + trigram similarity)
+  and fall back to raw when it diverges. That is a better answer to the SMART
+  rewriting problem above than "use verbatim", and it is not implemented here.
+- Their recording cap: soft warning at 9:00, hard stop and transcribe at 10:00.
+  No clever reconnection — they finalize before the server can cut them off.
+
+### Empty recordings, and what a timer cannot tell you
+A recording with no speech in it used to cost **~10 s** and hold the pipeline for
+all of them, so a key brushed by accident made the app look wedged. It broke down
+as ~0.7 s to raise the socket, the full `TAIL_FIRST_WAIT` (6 s) waiting for a
+chunk the service will never send for silence, then an empty result falling back
+to batch and paying its ~3 s floor. Three changes, in the order they matter:
+
+**1. Ask the audio first (`audio_toolkit/audio/speech_gate.rs`).** Ported from
+Jot's `DictationCoordinator`. A recording shorter than 0.4 s cannot contain a
+word; one that is silent in absolute terms *and* no louder than the room around
+it has nothing in it. Either verdict skips transcription entirely — no socket, no
+request, no wait. The room is the 10th percentile of 100 ms frame levels, not the
+minimum, so one anomalous frame cannot define it.
+
+Jot's asymmetry is the important part and is kept deliberately: **every clause can
+only ever prevent a discard, never cause one.** An unmeasurable room, an
+unmeasurable level, or a quiet peak that still rises 6 dB over the room all mean
+"send it". A wasted round trip costs a fraction of a cent; a discarded session
+costs the user's words.
+
+Calibrated against 200 real dictations from `recordings/`: the gate discards
+**zero** of them, with 23.5 dB of margin on level and 2.5x on duration.
+
+**Know its limits.** The absolute threshold (-58 dBFS) catches a dead microphone,
+not a quiet room. Martin's room tone peaks near -46 dBFS, only ~10 dB under his
+quietest speech, and richer features overlap too — the share of frames lifted
+10 dB over the room floor runs 0.25-0.74 for speech and 0.00-0.53 for pauses. Any
+threshold cutting through that would sometimes discard real words, so there isn't
+one. A deliberate silent hold longer than 0.4 s still reaches the provider.
+
+**2. Scale the tail wait to the audio (`cloud/gemini_live.rs::tail_first_wait`).**
+This is where a silent hold is bounded instead. `TAIL_FIRST_WAIT` is 6 s because
+a 142 s dictation takes 1.4 s to come back and undershooting there discards a
+finished transcript — but a transcript cannot outlast its audio, so the budget is
+now 800 ms plus 40 ms per audio second, capped at the old ceiling. It only ever
+shortens: long dictations keep the full 6 s. Measured margin on real short
+utterances: 184-303 ms used against an 850 ms budget. (Jot keeps theirs flat and
+simply pays it, on the stated grounds that waiting beats re-uploading. That is a
+defensible call; this is a cheaper one, and it is safe here only because of the
+paragraph below.)
+
+Note this is *not* load-bearing for correctness. The gate already ruled there is
+speech in the audio, so an empty transcript is a **dropped** one, and it falls
+back to batch. The timer bounds the wait; it does not decide anything a discard
+depends on.
+
+**3. Say what to do, not just what happened (`StreamOutcome`).** `finalize_stream`
+used to return `Option<String>`, and empty meant "batch-transcribe instead". That
+is right when "empty" can only mean "the socket broke" — for a cloud session it
+cannot, because heard-nothing is a correct answer. It now returns `Text`,
+`Silent` (healthy session, no speech) or `UseBatch` (no stream, or a broken one),
+so only a session that actually failed earns the fallback.
+
+Result: 9.5 s -> ~1.3 s for a sub-second recording, and the pointless second
+billed request is gone rather than merely faster.
+
+### Cancelling means cancelled
+Cancel used to mean "I don't want this", answered with "understood, after it
+finishes": `on_cancel` deliberately refused to reset while processing, so the
+stage stayed `Processing` and every keypress until the abandoned work drained was
+refused as "pipeline busy". Pressing cancel cost the app for as long as the thing
+being cancelled would have taken — and the paste was already suppressed, so the
+wait bought nothing.
+
+The stage is released immediately now. What the old code was guarding against is
+real, though, and is handled explicitly: **the pipeline is abandoned, not
+aborted** — the request in flight still runs — so its `ProcessingFinished`
+arrives late, when a new dictation may already be live. `stale_finishes` counts
+the completions belonging to cancelled pipelines and swallows exactly that many
+(a counter, not a flag, so two cancels in a row cannot leave one live). The same
+staleness applies to the UI: all three teardown sites in the pipeline tail go
+through `release_ui_unless_cancelled`, or a cancelled run landing behind a new
+recording would blank its pill.
+
+A lone tap is discarded rather than transcribed for the same reason — see
+`Effect::Discard` in the key-activation section above.
 
 ### Testing a streaming backend without a microphone
 `--stream` drives a WAV through the **real** streaming worker — engine lease,
@@ -380,6 +501,36 @@ shows up in Spotlight as a second "Handy". Deleting `src-tauri/target/release/bu
 safe (regenerated on rebuild; keeps the compile cache) — but keep the rest of `target/`.
 
 ---
+
+## Known open issues
+
+Written down because each one has already cost time to rediscover.
+
+- **A Live session dies at ~10 minutes and ships the fragment as if complete.**
+  Google sends `GoAway` first — the string appears nowhere in this repo, so it is
+  ignored — then aborts the socket. `SESSION_DEADLINE` is 15 min, *above*
+  Google's cap, so the client's own ceiling can never fire first. The worker sets
+  `failed`, logs it, and ignores it: the batch fallback only triggers on an
+  *empty* result, so a 10.6-minute dictation once pasted a third of itself with
+  no warning. Batch is not a usable fallback there either — it refuses clips over
+  ~7 minutes. Recovery that works by hand: split the WAV at a silence, batch each
+  half, join. Jot's answer to the same limit is a soft warning at 9:00 and a hard
+  stop plus transcribe at 10:00; no reconnection.
+- **A cancelled cloud transcription is still paid for.** Cancel abandons the
+  pipeline rather than aborting it, so the request in flight runs to completion
+  and is billed. Nothing user-visible depends on it.
+- **The Live panel with live text on still reserves 400x120** around a small
+  pill. It opens from text arriving rather than from a state change, so the
+  window cannot be grown in time; it needs an open/collapse event from the
+  frontend.
+- **SMART mode rewrites speech**, which is why `verbatim` is the mode to use. The
+  better fix is Jot's `ValidationGate` shape — take both the raw and the cleaned
+  text and fall back to raw when they diverge — rather than giving up cleanup
+  entirely.
+- **The tree is not `cargo fmt` clean**, and CI does not check it. Format the
+  lines you touch, not the files: several of these files are ones upstream also
+  owns, and a whole-file reformat is exactly the kind of thing that makes the
+  next merge expensive.
 
 ## Sync with upstream
 

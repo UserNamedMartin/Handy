@@ -578,9 +578,10 @@ fn run_headless_transcription(app: &AppHandle, args: &CliArgs) -> i32 {
         let streamed = tm.finalize_stream();
         let finalize_ms = finalize_start.elapsed().as_millis() as u64;
 
-        // The contract: an empty stream result means "batch-transcribe instead".
-        // Exercising it here is the point — a broken fallback is what turned a
-        // dead socket into a lost dictation.
+        // The contract: the stream says what to do with its own result, and
+        // `UseBatch` means "re-transcribe the same audio". Exercising it here is
+        // the point — a broken fallback is what turned a dead socket into a lost
+        // dictation.
         let (text, source) = match streamed {
             Ok(StreamOutcome::Text(t)) => (t, "stream"),
             // A healthy session that heard nothing. Reported distinctly so a

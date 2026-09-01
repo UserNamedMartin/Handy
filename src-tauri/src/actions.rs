@@ -802,7 +802,7 @@ impl ShortcutAction for TranscribeAction {
                     // running, finalize it and use its text (all audio was already
                     // fed to the stream); otherwise batch-transcribe the samples.
                     let transcription_time = Instant::now();
-    let transcription_result = match tm.finalize_stream() {
+                    let transcription_result = match tm.finalize_stream() {
                         // Usable text wins. `UseBatch` (no active stream, or one
                         // that broke) re-does the same audio in batch, so a dead
                         // socket costs latency rather than the dictation.

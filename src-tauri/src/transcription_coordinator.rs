@@ -195,9 +195,7 @@ enum Effect {
     /// which hands the audio to the pipeline: a discarded recording produces no
     /// text, costs no cloud request, and leaves the coordinator idle
     /// immediately rather than parked in `Processing`.
-    Discard {
-        binding_id: String,
-    },
+    Discard { binding_id: String },
 }
 
 /// Commands processed sequentially by the coordinator thread.

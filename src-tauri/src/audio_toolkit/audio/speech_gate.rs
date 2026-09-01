@@ -167,9 +167,7 @@ mod tests {
     fn tone(secs: f32, peak_dbfs: f32) -> Vec<f32> {
         let n = (SR as f32 * secs) as usize;
         let amp = dbfs_to_amp(peak_dbfs);
-        (0..n)
-            .map(|i| amp * (i as f32 * 0.05).sin())
-            .collect()
+        (0..n).map(|i| amp * (i as f32 * 0.05).sin()).collect()
     }
 
     #[test]

@@ -1029,8 +1029,14 @@ mod tests {
     /// window must be its own card plus the rounding guard — nothing more.
     #[test]
     fn overlay_dimensions_track_the_card_each_state_draws() {
-        let listening = (OVERLAY_REST_WIDTH + OVERLAY_SLACK, OVERLAY_BASE_HEIGHT + OVERLAY_SLACK);
-        let working = (OVERLAY_WORK_WIDTH + OVERLAY_SLACK, OVERLAY_BASE_HEIGHT + OVERLAY_SLACK);
+        let listening = (
+            OVERLAY_REST_WIDTH + OVERLAY_SLACK,
+            OVERLAY_BASE_HEIGHT + OVERLAY_SLACK,
+        );
+        let working = (
+            OVERLAY_WORK_WIDTH + OVERLAY_SLACK,
+            OVERLAY_BASE_HEIGHT + OVERLAY_SLACK,
+        );
 
         assert_eq!(overlay_dimensions("recording", false), listening);
         // Live text off: the streaming card is the compact pill, so the window
