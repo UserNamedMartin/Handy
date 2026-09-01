@@ -41,15 +41,37 @@ tauri_panel! {
 // these in sync with the CSS card geometry.
 //
 // Compact overlay (Minimal / transcribing / processing): the 24h pill animates
-// width from 92 (--ov-rest-w) to 132 (--ov-work-w) and expands from center, so
-// the window must fit the widest state plus a little slack.
-// This window is not just a canvas — it swallows every click inside it, so any
-// slack beyond the card is dead space over whatever sits underneath. These
-// previously described a 172/216-wide, 40-tall pill that the fork's "Tiny"
-// retune replaced, leaving ~80 px of click-eating margin either side of a 92 px
-// pill. Keep them in sync with the `--ov-*` vars in RecordingOverlay.css.
-const OVERLAY_WIDTH: f64 = 144.0;
-const OVERLAY_HEIGHT: f64 = 34.0;
+// width from 92 (--ov-rest-w) to 132 (--ov-work-w) and expands from center. The
+// grow happens on a state change, which resizes the window first, so the window
+// can track the resting width instead of standing at the working width all the
+// time.
+// This window is not just a canvas — it swallows every click inside it (there is
+// no `ignore_cursor_events` anywhere), so any slack beyond the card is invisible
+// dead space over whatever sits underneath. Sizing one window for the widest
+// state is therefore not good enough: the pill rests at 92 and only reaches 132
+// while transcribing, so a fixed 144-wide window left ~26 px of click-eating
+// margin either side for the whole time you are actually speaking. The window
+// now tracks the card the current state really draws — see `overlay_dimensions`.
+//
+// Card geometry, mirrored from the `--ov-*` custom properties in
+// RecordingOverlay.css. Keep them in sync; `overlay_dimensions` should be the
+// only reader.
+const OVERLAY_REST_WIDTH: f64 = 92.0; // --ov-rest-w: listening pill
+const OVERLAY_WORK_WIDTH: f64 = 132.0; // --ov-work-w: transcribing / processing pill
+const OVERLAY_BASE_HEIGHT: f64 = 24.0; // --ov-base-h: control-row height
+
+/// Total breathing room around the card (half per side). Purely a guard against
+/// subpixel rounding shaving the pill's 14 px corner radius — the pop animation
+/// scales 0.92 -> 1.0 and the dot's pulse ring stays inside the pill, so nothing
+/// is ever drawn past the card box and no real slack is needed.
+const OVERLAY_SLACK: f64 = 2.0;
+
+/// Neutral size for the compact overlay: the widest state it can reach. Used
+/// where no state is known yet — window creation, and as the fallback when the
+/// live window size can't be read — since a fallback must never be smaller than
+/// the card it has to hold.
+const OVERLAY_WIDTH: f64 = OVERLAY_WORK_WIDTH + OVERLAY_SLACK;
+const OVERLAY_HEIGHT: f64 = OVERLAY_BASE_HEIGHT + OVERLAY_SLACK;
 
 // The Live panel opens to 392x118 (--ov-open-w plus the text region), so its
 // window must fit the expanded form even while the pill is still small.
@@ -62,10 +84,19 @@ const OVERLAY_STREAM_HEIGHT: f64 = 120.0;
 /// off the streaming card never opens into a panel, so reserving panel-sized
 /// window would leave 400x120 of dead click area around a 92 px pill.
 fn overlay_dimensions(state: &str, live_text: bool) -> (f64, f64) {
-    if state == "streaming" && live_text {
-        (OVERLAY_STREAM_WIDTH, OVERLAY_STREAM_HEIGHT)
-    } else {
-        (OVERLAY_WIDTH, OVERLAY_HEIGHT)
+    let compact = |card_width: f64| (card_width + OVERLAY_SLACK, OVERLAY_BASE_HEIGHT + OVERLAY_SLACK);
+    match state {
+        // The Live panel opens into its text region on its own, driven by text
+        // arriving rather than by a state change, so Rust never gets a chance to
+        // grow the window first. It has to be pre-sized for the expanded form.
+        "streaming" if live_text => (OVERLAY_STREAM_WIDTH, OVERLAY_STREAM_HEIGHT),
+        // Listening. With live text off the streaming card renders as the
+        // compact pill (see RecordingOverlay.tsx) — same shape, same width.
+        "recording" | "streaming" => compact(OVERLAY_REST_WIDTH),
+        // "transcribing" / "processing": the wider working pill. Reached only
+        // via a state change, which resizes the window before the CSS width
+        // transition runs, so the grow is never clipped.
+        _ => compact(OVERLAY_WORK_WIDTH),
     }
 }
 
@@ -994,6 +1025,47 @@ mod tests {
         ));
     }
 
+    /// Every pixel of window beyond the card swallows a click, so each state's
+    /// window must be its own card plus the rounding guard — nothing more.
+    #[test]
+    fn overlay_dimensions_track_the_card_each_state_draws() {
+        let listening = (OVERLAY_REST_WIDTH + OVERLAY_SLACK, OVERLAY_BASE_HEIGHT + OVERLAY_SLACK);
+        let working = (OVERLAY_WORK_WIDTH + OVERLAY_SLACK, OVERLAY_BASE_HEIGHT + OVERLAY_SLACK);
+
+        assert_eq!(overlay_dimensions("recording", false), listening);
+        // Live text off: the streaming card is the compact pill, so the window
+        // must not reserve the panel. This is the regression that left ~26 px of
+        // dead click area either side of the pill while speaking.
+        assert_eq!(overlay_dimensions("streaming", false), listening);
+        assert_eq!(overlay_dimensions("transcribing", false), working);
+        assert_eq!(overlay_dimensions("processing", false), working);
+    }
+
+    /// The Live panel opens without a state change, so its window is the one
+    /// place that must still be pre-sized for the widest form.
+    #[test]
+    fn overlay_dimensions_reserve_the_panel_only_for_live_text() {
+        assert_eq!(
+            overlay_dimensions("streaming", true),
+            (OVERLAY_STREAM_WIDTH, OVERLAY_STREAM_HEIGHT)
+        );
+        // live_text only matters while streaming; the working pill is the same
+        // either way.
+        assert_eq!(
+            overlay_dimensions("transcribing", true),
+            overlay_dimensions("transcribing", false)
+        );
+    }
+
+    /// A fallback stands in where no state is known, so it must never be
+    /// narrower than the widest card it might have to hold.
+    #[test]
+    fn neutral_compact_size_covers_the_widest_compact_state() {
+        let (w, h) = overlay_dimensions("transcribing", false);
+        assert!(OVERLAY_WIDTH >= w, "{OVERLAY_WIDTH} < {w}");
+        assert!(OVERLAY_HEIGHT >= h, "{OVERLAY_HEIGHT} < {h}");
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_overlay_bounds_use_destination_monitor_scale() {
@@ -1005,8 +1077,8 @@ mod tests {
                 monitor_position,
                 monitor_size,
                 1.5,
-                OVERLAY_WIDTH,
-                OVERLAY_HEIGHT,
+                256.0,
+                46.0,
                 OverlayPosition::Bottom,
             ),
             (3648, 2031, 384, 69)
@@ -1016,8 +1088,8 @@ mod tests {
                 monitor_position,
                 monitor_size,
                 1.5,
-                OVERLAY_WIDTH,
-                OVERLAY_HEIGHT,
+                256.0,
+                46.0,
                 OverlayPosition::Top,
             ),
             (3648, 6, 384, 69)
@@ -1032,8 +1104,8 @@ mod tests {
                 PhysicalPosition::new(-2560, -200),
                 PhysicalSize::new(2560, 1440),
                 1.25,
-                OVERLAY_STREAM_WIDTH,
-                OVERLAY_STREAM_HEIGHT,
+                400.0,
+                120.0,
                 OverlayPosition::Bottom,
             ),
             (-1530, 1040, 500, 150)
