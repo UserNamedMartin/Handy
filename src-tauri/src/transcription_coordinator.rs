@@ -258,6 +258,16 @@ struct CoordinatorState {
     pending_release: Option<PendingRelease>,
     pending_tap: Option<PendingTap>,
     pending_press: Option<PendingPress>,
+    /// How many `ProcessingFinished` notifications belong to pipelines the user
+    /// already cancelled, and must therefore not act on the current stage.
+    ///
+    /// Cancelling during processing frees the coordinator immediately, so its
+    /// pipeline's completion arrives late and out of context — by then the user
+    /// may already be recording again, and letting that stale notification run
+    /// `on_processing_finished` would drop the live session back to `Idle` and
+    /// strand a recording nobody is tracking. Counted rather than flagged so two
+    /// cancels in a row cannot leave one stale notification live.
+    stale_finishes: u32,
 }
 
 impl CoordinatorState {
@@ -265,6 +275,7 @@ impl CoordinatorState {
         Self {
             stage: Stage::Idle,
             hold: None,
+            stale_finishes: 0,
             last_press: None,
             pending_release: None,
             pending_tap: None,
@@ -596,16 +607,34 @@ impl CoordinatorState {
         // An explicit cancel abandons any remembered start too — the user
         // asked for silence, not a deferred recording.
         self.pending_press = None;
-        // Don't reset during processing — wait for the pipeline to finish.
-        if !matches!(self.stage, Stage::Processing)
-            && (recording_was_active || matches!(self.stage, Stage::Recording(_)))
-        {
+        if matches!(self.stage, Stage::Processing) {
+            // Cancelling during transcription used to leave the stage parked
+            // here until the pipeline drained on its own, so every keypress in
+            // between was refused as "pipeline busy" — pressing cancel made the
+            // app unusable for as long as the work it was meant to abandon.
+            // Cancel means the result is unwanted, so nothing is waiting on that
+            // pipeline any more and the next dictation must be able to start at
+            // once. Its completion is now stale by construction.
+            self.stale_finishes += 1;
+            self.stage = Stage::Idle;
+            self.hold = None;
+            return;
+        }
+        if recording_was_active || matches!(self.stage, Stage::Recording(_)) {
             self.stage = Stage::Idle;
             self.hold = None;
         }
     }
 
     fn on_processing_finished(&mut self) -> Option<Effect> {
+        if self.stale_finishes > 0 {
+            // A cancelled pipeline reporting in. It has no claim on the stage:
+            // the user may be mid-dictation by now, and resetting to Idle here
+            // would strand that recording.
+            self.stale_finishes -= 1;
+            debug!("Ignoring completion of a cancelled pipeline");
+            return None;
+        }
         self.stage = Stage::Idle;
         self.hold = None;
         let pending = self.pending_press.take()?;
@@ -1220,8 +1249,9 @@ mod tests {
         assert_eq!(state.stage, Stage::Idle);
     }
 
-    /// Cancel while processing abandons a remembered press: the pipeline drains
-    /// to idle and nothing starts.
+    /// Cancel while processing abandons a remembered press and frees the
+    /// coordinator at once: pressing cancel must not cost the user the app for
+    /// as long as the work it abandoned would have taken.
     #[test]
     fn cancel_during_processing_drops_remembered_press() {
         let mut state = CoordinatorState::new();
@@ -1240,8 +1270,8 @@ mod tests {
         state.on_cancel(false);
         assert_eq!(
             state.stage,
-            Stage::Processing,
-            "cancel must not reset mid-processing — the pipeline still finishes"
+            Stage::Idle,
+            "cancel means the result is unwanted, so nothing waits on that pipeline"
         );
 
         let effect = state.on_processing_finished();
@@ -1250,6 +1280,85 @@ mod tests {
             "cancelled session must not spawn a deferred recording"
         );
         assert_eq!(state.stage, Stage::Idle);
+    }
+
+    /// The point of the change: cancel, then dictate again immediately. The old
+    /// behaviour parked the stage in `Processing` until the abandoned pipeline
+    /// drained, refusing every press until then.
+    #[test]
+    fn cancel_during_processing_leaves_the_next_dictation_startable_at_once() {
+        let mut state = CoordinatorState::new();
+        let now = Instant::now();
+
+        state.on_input(ptt_input(true), now);
+        state.on_input(ptt_input(false), now + Duration::from_millis(100));
+        assert!(matches!(state.on_grace_expired(), Some(Effect::Stop { .. })));
+        assert_eq!(state.stage, Stage::Processing);
+
+        state.on_cancel(false);
+
+        assert!(matches!(
+            state.on_input(ptt_input(true), now + Duration::from_millis(150)),
+            Some(Effect::Start { .. })
+        ));
+        assert_eq!(state.stage, Stage::Recording(BINDING.to_string()));
+    }
+
+    /// The hazard the counter exists for: the abandoned pipeline reports in
+    /// while a *new* dictation is live. Acting on it would reset the stage and
+    /// strand a recording nobody is tracking.
+    #[test]
+    fn a_cancelled_pipelines_completion_cannot_strand_the_new_recording() {
+        let mut state = CoordinatorState::new();
+        let now = Instant::now();
+
+        state.on_input(ptt_input(true), now);
+        state.on_input(ptt_input(false), now + Duration::from_millis(100));
+        state.on_grace_expired();
+        state.on_cancel(false);
+        state.on_input(ptt_input(true), now + Duration::from_millis(150));
+        assert_eq!(state.stage, Stage::Recording(BINDING.to_string()));
+
+        // The cancelled pipeline finally finishes, late and out of context.
+        assert!(state.on_processing_finished().is_none());
+        assert_eq!(
+            state.stage,
+            Stage::Recording(BINDING.to_string()),
+            "a stale completion must not touch the live recording"
+        );
+
+        // The live session still ends normally.
+        assert!(matches!(
+            state.on_input(ptt_input(false), now + Duration::from_millis(3000)),
+            None
+        ));
+        assert!(matches!(state.on_grace_expired(), Some(Effect::Stop { .. })));
+    }
+
+    /// Two cancels in a row must swallow two completions, not one — otherwise
+    /// the second stale notification is treated as live.
+    #[test]
+    fn two_cancelled_pipelines_swallow_two_completions() {
+        let mut state = CoordinatorState::new();
+        let mut now = Instant::now();
+
+        for _ in 0..2 {
+            state.on_input(ptt_input(true), now);
+            state.on_input(ptt_input(false), now + Duration::from_millis(100));
+            state.on_grace_expired();
+            state.on_cancel(false);
+            now += Duration::from_millis(500);
+        }
+
+        state.on_input(ptt_input(true), now);
+        assert_eq!(state.stage, Stage::Recording(BINDING.to_string()));
+        assert!(state.on_processing_finished().is_none());
+        assert!(state.on_processing_finished().is_none());
+        assert_eq!(
+            state.stage,
+            Stage::Recording(BINDING.to_string()),
+            "both stale completions must be swallowed"
+        );
     }
 
     fn toggle_input(external: bool) -> InputEvent {

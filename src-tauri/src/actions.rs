@@ -90,6 +90,26 @@ fn build_system_prompt(prompt_template: &str) -> String {
 /// LLM call when nothing was actually transcribed, which would otherwise make
 /// the model reply with an error message such as "you need to provide the
 /// transcription".
+/// Return the overlay and tray to idle — unless this pipeline was cancelled.
+///
+/// A cancelled pipeline is abandoned, not aborted: the request already in flight
+/// still runs to completion in the background. Since cancelling now frees the
+/// coordinator immediately, the user can be recording again by the time this
+/// lands, and the overlay and tray belong to that new session. Tearing them down
+/// from here would blank a live recording's pill.
+fn release_ui_unless_cancelled(
+    app: &AppHandle,
+    rm: &AudioRecordingManager,
+    cancel_generation: u64,
+) {
+    if rm.was_cancelled_since(cancel_generation) {
+        debug!("Pipeline was cancelled; leaving the overlay to whoever owns it now");
+        return;
+    }
+    utils::hide_recording_overlay(app);
+    set_tray_state(app, TrayIconState::Idle);
+}
+
 fn is_blank_transcription(transcription: &str) -> bool {
     transcription.trim().is_empty()
 }
@@ -940,8 +960,7 @@ impl ShortcutAction for TranscribeAction {
                             }
 
                             if processed.final_text.is_empty() {
-                                utils::hide_recording_overlay(&ah);
-                                set_tray_state(&ah, TrayIconState::Idle);
+                                release_ui_unless_cancelled(&ah, &rm, cancel_generation);
                             } else {
                                 let ah_clone = ah.clone();
                                 let paste_time = Instant::now();
@@ -949,9 +968,9 @@ impl ShortcutAction for TranscribeAction {
                                 let rm_for_paste = Arc::clone(&rm);
                                 ah.run_on_main_thread(move || {
                                     if rm_for_paste.was_cancelled_since(cancel_generation) {
+                                        // Cancel already returned the UI to idle,
+                                        // and a new dictation may own it by now.
                                         debug!("Transcription operation cancelled before paste");
-                                        utils::hide_recording_overlay(&ah_clone);
-                                        set_tray_state(&ah_clone, TrayIconState::Idle);
                                         return;
                                     }
 
@@ -970,8 +989,7 @@ impl ShortcutAction for TranscribeAction {
                                 })
                                 .unwrap_or_else(|e| {
                                     error!("Failed to run paste on main thread: {:?}", e);
-                                    utils::hide_recording_overlay(&ah);
-                                    set_tray_state(&ah, TrayIconState::Idle);
+                                    release_ui_unless_cancelled(&ah, &rm, cancel_generation);
                                 });
                             }
                         }
