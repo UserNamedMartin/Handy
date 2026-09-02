@@ -39,6 +39,39 @@ static MIGRATIONS: &[M] = &[
     M::up("ALTER TABLE transcription_history ADD COLUMN model_id TEXT;"),
     M::up("ALTER TABLE transcription_history ADD COLUMN engine TEXT;"),
     M::up("ALTER TABLE transcription_history ADD COLUMN cost_usd REAL;"),
+    // Usage accounting moves out of `transcription_history`, because that table
+    // is a *cache* — `cleanup_by_count` trims it to `history_limit` (200) and
+    // deletes the audio with it. Reporting usage from it meant the report
+    // silently forgot the past: at ~150 dictations a day it remembered about a
+    // day and a half, a month's retrospective could never show a month, and a
+    // day already reported would shrink every time it was looked at. Observed
+    // on a real store hours apart: 2026-08-31 went from 61 dictations / 25.6 min
+    // to 3 / 11.1 min, and 2026-08-30 (123 dictations, 81.9 min) vanished
+    // outright. The three that survived were the ones starred by hand, which
+    // pruning spares — so the "usage" left standing was just the starred rows.
+    //
+    // These rows are append-only and never pruned. They are ~40 bytes each;
+    // at his rate that is under 2 MB a year, which buys a report that does not
+    // lie.
+    M::up(
+        "CREATE TABLE IF NOT EXISTS usage_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp INTEGER NOT NULL,
+            duration_ms INTEGER,
+            model_id TEXT,
+            engine TEXT,
+            cost_usd REAL
+        );",
+    ),
+    M::up("CREATE INDEX IF NOT EXISTS idx_usage_events_timestamp ON usage_events(timestamp);"),
+    // Seed from whatever history still holds. It cannot bring back what pruning
+    // already deleted — that is gone with its audio — but it means the report
+    // starts from the surviving entries rather than from zero.
+    M::up(
+        "INSERT INTO usage_events (timestamp, duration_ms, model_id, engine, cost_usd)
+         SELECT timestamp, duration_ms, model_id, engine, cost_usd
+         FROM transcription_history;",
+    ),
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize, Type)]
@@ -288,6 +321,14 @@ impl HistoryManager {
 
     fn usage_buckets(&self, period_expr: &str, since: Option<i64>) -> Result<Vec<UsageBucket>> {
         let conn = self.get_connection()?;
+        Self::usage_buckets_with_conn(&conn, period_expr, since)
+    }
+
+    fn usage_buckets_with_conn(
+        conn: &Connection,
+        period_expr: &str,
+        since: Option<i64>,
+    ) -> Result<Vec<UsageBucket>> {
         // `period_expr` is a fixed literal chosen by the two callers above, never
         // user input, so interpolating it into the SQL is safe.
         let sql = format!(
@@ -296,7 +337,7 @@ impl HistoryManager {
                     COALESCE(SUM(duration_ms), 0) / 1000.0 AS seconds,
                     COALESCE(SUM(cost_usd), 0) AS cost_usd,
                     SUM(CASE WHEN duration_ms IS NOT NULL THEN 1 ELSE 0 END) AS measured
-             FROM transcription_history
+             FROM usage_events
              WHERE timestamp >= ?1
              GROUP BY period
              ORDER BY period ASC",
@@ -319,12 +360,16 @@ impl HistoryManager {
     /// Lifetime totals and the per-model split.
     pub fn usage_summary(&self) -> Result<UsageSummary> {
         let conn = self.get_connection()?;
+        Self::usage_summary_with_conn(&conn)
+    }
+
+    fn usage_summary_with_conn(conn: &Connection) -> Result<UsageSummary> {
         let (dictations, seconds, cost_usd, measured) = conn.query_row(
             "SELECT COUNT(*),
                     COALESCE(SUM(duration_ms), 0) / 1000.0,
                     COALESCE(SUM(cost_usd), 0),
                     SUM(CASE WHEN duration_ms IS NOT NULL THEN 1 ELSE 0 END)
-             FROM transcription_history",
+             FROM usage_events",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get::<_, Option<i64>>(3)?)),
         )?;
@@ -335,7 +380,7 @@ impl HistoryManager {
                     COUNT(*) AS dictations,
                     COALESCE(SUM(duration_ms), 0) / 1000.0 AS seconds,
                     COALESCE(SUM(cost_usd), 0) AS cost_usd
-             FROM transcription_history
+             FROM usage_events
              GROUP BY model_id, engine
              ORDER BY seconds DESC",
         )?;
@@ -364,21 +409,22 @@ impl HistoryManager {
         &self.recordings_dir
     }
 
-    /// Save a new history entry to the database.
-    /// The WAV file should already have been written to the recordings directory.
-    pub fn save_entry(
-        &self,
-        file_name: String,
-        transcription_text: String,
+    /// Write one dictation: the history row (a trimmed cache) and the usage row
+    /// (an append-only ledger). Returns the **history** entry's id.
+    ///
+    /// Static and connection-taking so the id contract below is testable.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_dictation_with_conn(
+        conn: &Connection,
+        file_name: &str,
+        timestamp: i64,
+        title: &str,
+        transcription_text: &str,
         post_process_requested: bool,
-        post_processed_text: Option<String>,
-        post_process_prompt: Option<String>,
-        usage: DictationUsage,
-    ) -> Result<HistoryEntry> {
-        let timestamp = Utc::now().timestamp();
-        let title = self.format_timestamp_title(timestamp);
-
-        let conn = self.get_connection()?;
+        post_processed_text: Option<&str>,
+        post_process_prompt: Option<&str>,
+        usage: &DictationUsage,
+    ) -> Result<i64> {
         conn.execute(
             "INSERT INTO transcription_history (
                 file_name,
@@ -395,13 +441,13 @@ impl HistoryManager {
                 cost_usd
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
-                &file_name,
+                file_name,
                 timestamp,
                 false,
-                &title,
-                &transcription_text,
-                &post_processed_text,
-                &post_process_prompt,
+                title,
+                transcription_text,
+                post_processed_text,
+                post_process_prompt,
                 post_process_requested,
                 usage.duration_ms,
                 &usage.model_id,
@@ -410,8 +456,59 @@ impl HistoryManager {
             ],
         )?;
 
+        // Read the id BEFORE the ledger insert below — `last_insert_rowid()` is
+        // per-connection, not per-table, so taking it afterwards would hand the
+        // history entry the usage row's id and break every operation that
+        // addresses an entry by id.
+        let entry_id = conn.last_insert_rowid();
+
+        // The usage ledger is deliberately a second row rather than a column on
+        // the one above: `transcription_history` is trimmed to `history_limit`
+        // and this must outlive it.
+        conn.execute(
+            "INSERT INTO usage_events (timestamp, duration_ms, model_id, engine, cost_usd)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                timestamp,
+                usage.duration_ms,
+                &usage.model_id,
+                &usage.engine,
+                usage.cost_usd,
+            ],
+        )?;
+
+        Ok(entry_id)
+    }
+
+    /// Save a new history entry to the database.
+    /// The WAV file should already have been written to the recordings directory.
+    pub fn save_entry(
+        &self,
+        file_name: String,
+        transcription_text: String,
+        post_process_requested: bool,
+        post_processed_text: Option<String>,
+        post_process_prompt: Option<String>,
+        usage: DictationUsage,
+    ) -> Result<HistoryEntry> {
+        let timestamp = Utc::now().timestamp();
+        let title = self.format_timestamp_title(timestamp);
+
+        let conn = self.get_connection()?;
+        let entry_id = Self::insert_dictation_with_conn(
+            &conn,
+            &file_name,
+            timestamp,
+            &title,
+            &transcription_text,
+            post_process_requested,
+            post_processed_text.as_deref(),
+            post_process_prompt.as_deref(),
+            &usage,
+        )?;
+
         let entry = HistoryEntry {
-            id: conn.last_insert_rowid(),
+            id: entry_id,
             file_name,
             timestamp,
             saved: false,
@@ -825,11 +922,41 @@ mod tests {
                 transcription_text TEXT NOT NULL,
                 post_processed_text TEXT,
                 post_process_prompt TEXT,
-                post_process_requested BOOLEAN NOT NULL DEFAULT 0
+                post_process_requested BOOLEAN NOT NULL DEFAULT 0,
+                duration_ms INTEGER,
+                model_id TEXT,
+                engine TEXT,
+                cost_usd REAL
             );",
         )
         .expect("create transcription_history table");
+        conn.execute_batch(
+            "CREATE TABLE usage_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                duration_ms INTEGER,
+                model_id TEXT,
+                engine TEXT,
+                cost_usd REAL
+            );",
+        )
+        .expect("create usage_events table");
         conn
+    }
+
+    fn insert_usage(conn: &Connection, timestamp: i64, duration_ms: Option<i64>, cost: Option<f64>) {
+        conn.execute(
+            "INSERT INTO usage_events (timestamp, duration_ms, model_id, engine, cost_usd)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                timestamp,
+                duration_ms,
+                "gemini-3.5-transcribe-live",
+                "cloud",
+                cost,
+            ],
+        )
+        .expect("insert usage event");
     }
 
     fn insert_entry(conn: &Connection, timestamp: i64, text: &str, post_processed: Option<&str>) {
@@ -856,6 +983,129 @@ mod tests {
             ],
         )
         .expect("insert history entry");
+    }
+
+    /// `last_insert_rowid()` is per-connection, not per-table, so writing the
+    /// usage row before reading it would hand the history entry the ledger's id
+    /// — and every operation that addresses an entry by id (delete, star) would
+    /// then act on the wrong row, or on nothing. Introduced and caught by
+    /// reading; this is here so it cannot come back quietly.
+    #[test]
+    fn the_returned_id_addresses_the_history_row_not_the_ledger_row() {
+        let conn = setup_conn();
+        // Give the ledger a head start, so the two tables' rowids cannot
+        // coincide and a mix-up would be invisible.
+        for i in 0..5 {
+            insert_usage(&conn, 1_788_000_000 + i, Some(1_000), None);
+        }
+
+        let usage = DictationUsage {
+            duration_ms: Some(4_200),
+            model_id: Some("gemini-3.5-transcribe-live".to_string()),
+            engine: Some("cloud".to_string()),
+            cost_usd: Some(0.00063),
+        };
+        let id = HistoryManager::insert_dictation_with_conn(
+            &conn,
+            "handy-1.wav",
+            1_788_100_000,
+            "Recording",
+            "привет",
+            false,
+            None,
+            None,
+            &usage,
+        )
+        .expect("insert dictation");
+
+        let text: String = conn
+            .query_row(
+                "SELECT transcription_text FROM transcription_history WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .expect("the id must address the history row");
+        assert_eq!(text, "привет");
+
+        // And the ledger got its own row for the same dictation.
+        let events: i64 = conn
+            .query_row("SELECT COUNT(*) FROM usage_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(events, 6);
+    }
+
+    /// The bug this table exists for: usage was reported `FROM
+    /// transcription_history`, which `cleanup_by_count` trims to
+    /// `history_limit`. A day already reported therefore shrank every time it
+    /// was looked at, and eventually vanished — on a real store, 2026-08-31 went
+    /// from 61 dictations / 25.6 min to 3 / 11.1 min within hours, and the three
+    /// survivors were the hand-starred rows that pruning spares.
+    #[test]
+    fn pruning_history_does_not_change_the_usage_report() {
+        let conn = setup_conn();
+        for i in 0..10 {
+            let ts = 1_788_000_000 + i * 60;
+            insert_entry(&conn, ts, "text", None);
+            insert_usage(&conn, ts, Some(30_000), Some(0.0045));
+        }
+
+        let before = HistoryManager::usage_summary_with_conn(&conn).expect("summary before");
+        assert_eq!(before.dictations, 10);
+        assert_eq!(before.measured, 10);
+        assert!((before.seconds - 300.0).abs() < 1e-6);
+
+        // Pruning keeps the newest two, exactly as cleanup_by_count would.
+        conn.execute(
+            "DELETE FROM transcription_history WHERE id NOT IN (
+                 SELECT id FROM transcription_history ORDER BY timestamp DESC LIMIT 2
+             )",
+            [],
+        )
+        .expect("prune history");
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM transcription_history", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+
+        let after = HistoryManager::usage_summary_with_conn(&conn).expect("summary after");
+        assert_eq!(
+            after.dictations, before.dictations,
+            "usage must survive the history cache being trimmed"
+        );
+        assert!((after.seconds - before.seconds).abs() < 1e-6);
+        assert!((after.cost_usd - before.cost_usd).abs() < 1e-9);
+    }
+
+    /// Entries written before usage accounting existed have no duration, and the
+    /// report must read them as untimed rather than as a quiet day.
+    #[test]
+    fn usage_counts_untimed_events_without_inventing_duration() {
+        let conn = setup_conn();
+        insert_usage(&conn, 1_788_000_000, Some(12_000), Some(0.0018));
+        insert_usage(&conn, 1_788_000_060, None, None);
+
+        let summary = HistoryManager::usage_summary_with_conn(&conn).expect("summary");
+        assert_eq!(summary.dictations, 2);
+        assert_eq!(summary.measured, 1, "only one event carried a duration");
+        assert!((summary.seconds - 12.0).abs() < 1e-6);
+    }
+
+    /// Daily buckets group by local-time day and come back oldest first.
+    #[test]
+    fn usage_buckets_group_by_period_and_survive_pruning() {
+        let conn = setup_conn();
+        // Two events a day apart; both far enough in the past to be stable.
+        insert_usage(&conn, 1_788_000_000, Some(60_000), Some(0.009));
+        insert_usage(&conn, 1_788_000_000 + 86_400, Some(30_000), Some(0.0045));
+
+        let buckets =
+            HistoryManager::usage_buckets_with_conn(&conn, "date(timestamp, 'unixepoch')", None)
+                .expect("buckets");
+        assert_eq!(buckets.len(), 2, "one bucket per day");
+        assert_eq!(buckets[0].dictations, 1);
+        assert!(buckets[0].period < buckets[1].period, "oldest first");
     }
 
     #[test]
