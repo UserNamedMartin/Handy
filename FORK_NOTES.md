@@ -352,10 +352,35 @@ would not reveal. `source` distinguishes `stream` from `batch-fallback`.
 Handy's VAD, using the recorder's own detector, threshold and hangover.
 
 ### Usage & spend tracking (`Usage` sidebar section)
-`transcription_history` gained nullable `duration_ms` / `model_id` / `engine` /
-`cost_usd` (migrations in `managers/history.rs`), written per dictation by
+Usage lives in its own table, **`usage_events`** (timestamp / duration_ms /
+model_id / engine / cost_usd; migrations in `managers/history.rs`), written per
+dictation by `insert_dictation_with_conn` beside the history row and fed by
 `dictation_usage()` in `actions.rs`. Failed transcriptions record a duration but
 **no cost** — billing a request that produced nothing would inflate the report.
+
+**It is a ledger, and `transcription_history` is a cache. Do not confuse them.**
+This shipped reading `FROM transcription_history`, which `cleanup_by_count` trims
+to `history_limit` (200), deleting the audio with it — so the report silently
+forgot the past. At ~150 dictations a day it remembered about a day and a half, a
+month's retrospective could never show a month, and a day already reported shrank
+every time it was looked at. Observed on the real store hours apart: 2026-08-31
+went from 61 dictations / 25.6 min to 3 / 11.1 min, and 2026-08-30 (123
+dictations, 81.9 min) vanished outright. The three survivors were exactly the
+hand-starred rows, which pruning spares — so the "usage" still on screen for that
+day was three starred dictations, one of them 10.6 minutes long, and that was the
+whole of the 11.1 minutes shown.
+
+`usage_events` is append-only and deleted from nowhere; neither `history_limit`
+nor `recording_retention_period` touches it. Rows are ~40 bytes, under 2 MB a
+year at that rate. The migration seeds it from whatever history still held, so
+the report starts from the survivors rather than from zero — it cannot recover
+what pruning already deleted, and 2026-08-30 is gone with its audio.
+
+**Watch `last_insert_rowid()` if you add another write here.** It is
+per-connection, not per-table: reading it *after* the ledger insert hands the
+history entry the ledger's id, and every operation that addresses an entry by id
+(delete, star) then acts on the wrong row. `insert_dictation_with_conn` exists so
+that ordering is pinned by a test rather than by care.
 
 `usage_daily` / `usage_monthly` / `usage_summary` aggregate in SQL (local-time
 day and month buckets); commands are in `commands/history.rs`. The UI
@@ -367,6 +392,14 @@ in Cloud Console — so `cloud::estimate_cost_usd` multiplies billed duration by
 published blended rate ($0.005/min batch, $0.009/min Live). Buckets also carry
 `measured`, the count of entries that actually had a duration, so pre-migration
 history reads as "untimed" rather than as a quiet week.
+
+**What the ledger does not see.** It has no link back to a dictation (no
+`file_name`, no history id), so "which dictation cost the most" is unanswerable —
+add a column if that ever matters. A recording the speech gate rejects never
+reaches `save_entry`, so accidental key brushes are invisible to the report;
+nothing was sent and nothing was billed, but the count of them is not tracked
+either. A *cancelled* dictation does appear, with its cost, and should: cancel
+abandons the request rather than aborting it, so it was still paid for.
 
 **Whisper-mode tuning harnesses (in-repo, not part of the app build):** `src-tauri/examples/whisper_gain_sweep.rs` (gain × VAD-threshold sweep → WER + VAD pass-rate + end-to-end gated WER), `whisper_stress.rs` (silence-hallucination + noise robustness), `whisper_gate_tune.rs` (VAD threshold sweep), `whisper_halluc_guard.rs` (decoder `no_speech_thold`/`logprob_thold`). They read WAV corpora in `examples/whisper_corpus/` (real recordings) and `examples/whisper_stress/` (synthesized). Corpus captured with a Playwright-driven raw-mic recorder page (getUserMedia with AGC/NS/EC off). Run e.g. `cargo run --release --example whisper_gain_sweep`.
 
