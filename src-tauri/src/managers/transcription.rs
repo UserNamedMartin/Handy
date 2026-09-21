@@ -4,6 +4,7 @@ use crate::audio_toolkit::{
     StreamSegmenterConfig,
 };
 use crate::managers::audio::AudioRecordingManager;
+use crate::cloud::elevenlabs::ElevenLabsTranscriber;
 use crate::cloud::gemini::GeminiTranscriber;
 use crate::cloud::gemini_live::{join_finals, tail_first_wait, GeminiLiveSession, LiveEvent};
 use crate::managers::model::{EngineType, ModelManager};
@@ -272,9 +273,10 @@ enum LoadedEngine {
     GigaAM(GigaAMModel),
     Canary(CanaryModel),
     Cohere(CohereModel),
-    /// The one non-local engine: an HTTP client, not a model. Nothing is
+    /// The non-local engines: an HTTP client, not a model. Nothing is
     /// resident, so unload/reload is free and the unload timeout is moot.
     Gemini(GeminiTranscriber),
+    ElevenLabs(ElevenLabsTranscriber),
 }
 
 /// RAII guard that clears the `is_loading` flag and notifies waiters on drop.
@@ -606,7 +608,10 @@ impl TranscriptionManager {
 
         // Cloud engines have no file to resolve, and asking for one errors.
         // Every local branch below uses `model_path`; the cloud branch ignores it.
-        let model_path = if matches!(model_info.engine_type, EngineType::Gemini) {
+        let model_path = if matches!(
+            model_info.engine_type,
+            EngineType::Gemini | EngineType::ElevenLabs
+        ) {
             std::path::PathBuf::new()
         } else {
             self.model_manager.get_model_path(model_id)?
@@ -809,6 +814,26 @@ impl TranscriptionManager {
                     e
                 })?;
                 LoadedEngine::Gemini(engine)
+            }
+            EngineType::ElevenLabs => {
+                // Same story as Gemini above: "loading" is wiring up
+                // credentials, and the one failure mode is a missing key.
+                let settings = get_settings(&self.app_handle);
+                let api_key = settings
+                    .cloud_api_keys
+                    .get(crate::cloud::elevenlabs::PROVIDER_ID)
+                    .cloned()
+                    .unwrap_or_default();
+
+                let engine = ElevenLabsTranscriber::new(
+                    api_key,
+                    crate::cloud::elevenlabs::API_MODEL.to_string(),
+                )
+                .map_err(|e| {
+                    emit_loading_failed(&e.to_string());
+                    e
+                })?;
+                LoadedEngine::ElevenLabs(engine)
             }
         };
 
@@ -1930,6 +1955,9 @@ impl TranscriptionManager {
                         &validated_language,
                         &settings.custom_words,
                     ),
+                    LoadedEngine::ElevenLabs(engine) => {
+                        engine.transcribe(&audio, &validated_language)
+                    }
                 }
             }));
 

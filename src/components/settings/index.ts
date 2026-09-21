@@ -8,7 +8,12 @@ export { PostProcessingSettings } from "./post-processing/PostProcessingSettings
 export { ModelsSettings } from "./models/ModelsSettings";
 export { UsageSettings } from "./usage/UsageSettings";
 export { ShowLiveTranscript } from "./ShowLiveTranscript";
-export { CloudModelSettings, isGeminiModel } from "./models/CloudModelSettings";
+export {
+  CloudModelSettings,
+  isCloudModel,
+  isElevenLabsModel,
+  isGeminiModel,
+} from "./models/CloudModelSettings";
 
 // Individual setting components
 export { MicrophoneSelector } from "./MicrophoneSelector";

@@ -1135,11 +1135,16 @@ export type EngineType =
  */
 "TranscribeCpp" | "Parakeet" | "Moonshine" | "MoonshineStreaming" | "SenseVoice" | "GigaAM" | "Canary" | "Cohere" | 
 /**
- * Google Gemini 3.5 Transcribe, over the network. The only non-local
- * engine: nothing is downloaded and nothing runs on this machine — see
- * [`crate::cloud::gemini`].
+ * Google Gemini 3.5 Transcribe, over the network. Nothing is downloaded
+ * and nothing runs on this machine — see [`crate::cloud::gemini`].
  */
-"Gemini"
+"Gemini" | 
+/**
+ * ElevenLabs Scribe v2, over the network — see
+ * [`crate::cloud::elevenlabs`]. Same deal as [`EngineType::Gemini`]: an
+ * HTTP client, not a model.
+ */
+"ElevenLabs"
 /**
  * Which transcription mode Gemini 3.5 Transcribe runs in.
  * 

@@ -9,8 +9,19 @@ const GEMINI_PROVIDER = "gemini";
 /** Catalog ids served by the Gemini backend. */
 const GEMINI_MODELS = ["gemini-3.5-transcribe", "gemini-3.5-transcribe-live"];
 
+const ELEVENLABS_PROVIDER = "elevenlabs";
+/** Catalog ids served by the ElevenLabs backend. */
+const ELEVENLABS_MODELS = ["elevenlabs-scribe-v2"];
+
 export const isGeminiModel = (modelId: string | undefined): boolean =>
   !!modelId && GEMINI_MODELS.includes(modelId);
+
+export const isElevenLabsModel = (modelId: string | undefined): boolean =>
+  !!modelId && ELEVENLABS_MODELS.includes(modelId);
+
+/** Any model whose audio leaves this machine, i.e. one this card configures. */
+export const isCloudModel = (modelId: string | undefined): boolean =>
+  isGeminiModel(modelId) || isElevenLabsModel(modelId);
 
 /** Comma-separated text ⇄ list, tolerant of stray whitespace and empties. */
 const parseList = (raw: string): string[] =>
@@ -34,6 +45,43 @@ const Row: React.FC<{
 );
 
 /**
+ * The one row every cloud provider needs. Keyed by provider so the stored map
+ * can hold a key per backend and switching models does not clobber the other.
+ */
+const ApiKeyRow: React.FC<{
+  provider: string;
+  placeholder: string;
+  hint: string;
+}> = ({ provider, placeholder, hint }) => {
+  const { t } = useTranslation();
+  const { getSetting, updateSetting } = useSettings();
+  const keys = (getSetting("cloud_api_keys") ?? {}) as Record<string, string>;
+  const storedKey = keys[provider] ?? "";
+  const [apiKey, setApiKey] = useState(storedKey);
+
+  useEffect(() => setApiKey(storedKey), [storedKey]);
+
+  return (
+    <Row label={t("settings.models.cloud.apiKey")} hint={hint}>
+      <Input
+        type="password"
+        variant="compact"
+        value={apiKey}
+        placeholder={placeholder}
+        onChange={(event) => setApiKey(event.target.value)}
+        onBlur={() =>
+          updateSetting("cloud_api_keys", {
+            ...keys,
+            [provider]: apiKey.trim(),
+          })
+        }
+        className="flex-1 max-w-[320px]"
+      />
+    </Row>
+  );
+};
+
+/**
  * Settings that belong to the Gemini cloud models specifically — knobs no local
  * engine has.
  *
@@ -46,18 +94,28 @@ export const CloudModelSettings: React.FC = () => {
   const { getSetting, updateSetting } = useSettings();
 
   const config = getSetting("gemini_transcribe");
-  const keys = getSetting("cloud_api_keys") ?? {};
-  const storedKey = (keys as Record<string, string>)[GEMINI_PROVIDER] ?? "";
+  const selectedModel = getSetting("selected_model");
 
-  const [apiKey, setApiKey] = useState(storedKey);
   const [languages, setLanguages] = useState("");
   const [vocabulary, setVocabulary] = useState("");
 
-  useEffect(() => setApiKey(storedKey), [storedKey]);
   useEffect(() => {
     setLanguages((config?.language_codes ?? []).join(", "));
     setVocabulary((config?.custom_vocabulary ?? []).join(", "));
   }, [config?.language_codes, config?.custom_vocabulary]);
+
+  // ElevenLabs has no per-model knobs of its own — mode, language hints and
+  // vocabulary biasing are all Gemini's API surface — so a key is the whole
+  // configuration surface for it.
+  if (isElevenLabsModel(selectedModel ?? undefined)) {
+    return (
+      <ApiKeyRow
+        provider={ELEVENLABS_PROVIDER}
+        placeholder="sk_…"
+        hint={t("settings.models.cloud.apiKeyHintElevenLabs")}
+      />
+    );
+  }
 
   if (!config) return null;
 
@@ -74,25 +132,11 @@ export const CloudModelSettings: React.FC = () => {
 
   return (
     <>
-      <Row
-        label={t("settings.models.cloud.apiKey")}
+      <ApiKeyRow
+        provider={GEMINI_PROVIDER}
+        placeholder="AIza…"
         hint={t("settings.models.cloud.apiKeyHint")}
-      >
-        <Input
-          type="password"
-          variant="compact"
-          value={apiKey}
-          placeholder="AIza…"
-          onChange={(event) => setApiKey(event.target.value)}
-          onBlur={() =>
-            updateSetting("cloud_api_keys", {
-              ...(keys as Record<string, string>),
-              [GEMINI_PROVIDER]: apiKey.trim(),
-            })
-          }
-          className="flex-1 max-w-[320px]"
-        />
-      </Row>
+      />
 
       <Row
         label={t("settings.models.cloud.mode")}

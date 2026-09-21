@@ -6,7 +6,7 @@ import { TranslateToEnglish } from "../TranslateToEnglish";
 import { useModelStore } from "../../../stores/modelStore";
 import {
   CloudModelSettings,
-  isGeminiModel,
+  isCloudModel,
 } from "../models/CloudModelSettings";
 import type { ModelInfo } from "@/bindings";
 import {
@@ -31,7 +31,7 @@ export const ModelSettingsCard: React.FC = () => {
   const showLanguageSelector =
     supportsLanguageSelection || supportsChineseOnlyScriptSelection;
   const supportsTranslation = currentModelInfo?.supports_translation ?? false;
-  const isCloud = isGeminiModel(currentModel ?? undefined);
+  const isCloud = isCloudModel(currentModel ?? undefined);
   const hasAnySettings = showLanguageSelector || supportsTranslation || isCloud;
 
   // Don't render anything if no model is selected or no settings available

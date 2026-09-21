@@ -11,10 +11,17 @@
 //! `LoadedEngine` match in [`crate::managers::transcription`] alongside the
 //! local engines, with no async colouring anywhere upstream.
 
+pub mod elevenlabs;
 pub mod gemini;
 pub mod gemini_live;
 
+use anyhow::{anyhow, Result};
 use std::future::Future;
+use std::io::Cursor;
+
+/// Handy always hands engines 16 kHz mono f32 (the recorder resamples to this),
+/// so the WAV header the cloud backends synthesize is fixed rather than derived.
+const WAV_SAMPLE_RATE: u32 = 16_000;
 
 /// Run a future to completion from a synchronous caller, whatever context that
 /// caller is in.
@@ -50,6 +57,40 @@ where
     })
 }
 
+/// Encode 16 kHz mono f32 samples as an in-memory 16-bit PCM WAV.
+///
+/// Shared by every cloud backend: `audio/wav` is on both Gemini's and
+/// ElevenLabs' accepted MIME lists and `hound` is already a dependency, so this
+/// costs nothing. FLAC would halve the upload, which is worth revisiting if
+/// payload time ever shows up in the timings.
+pub(crate) fn encode_wav_16k(audio: &[f32]) -> Result<Vec<u8>> {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: WAV_SAMPLE_RATE,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+
+    let mut buffer = Cursor::new(Vec::with_capacity(audio.len() * 2 + 44));
+    {
+        let mut writer = hound::WavWriter::new(&mut buffer, spec)
+            .map_err(|e| anyhow!("Failed to start WAV encoding: {}", e))?;
+        for sample in audio {
+            // Clamp before scaling: the recorder's auto-gain can push a boosted
+            // whisper right up to full scale, and an out-of-range cast wraps.
+            let clamped = sample.clamp(-1.0, 1.0);
+            writer
+                .write_sample((clamped * i16::MAX as f32) as i16)
+                .map_err(|e| anyhow!("Failed to encode WAV sample: {}", e))?;
+        }
+        writer
+            .finalize()
+            .map_err(|e| anyhow!("Failed to finalize WAV encoding: {}", e))?;
+    }
+
+    Ok(buffer.into_inner())
+}
+
 /// Published price in USD per minute of audio for a paid model, or `None` for
 /// anything that runs locally and therefore costs nothing.
 ///
@@ -62,6 +103,10 @@ pub fn usd_per_minute(model_id: &str) -> Option<f64> {
     match model_id {
         gemini::MODEL_ID => Some(0.005),
         gemini_live::LIVE_MODEL_ID => Some(0.009),
+        // ElevenLabs publishes Scribe v2 as a flat $0.22 per audio hour, with no
+        // separate charge for the text it returns — so unlike Google's blended
+        // figure this one is exact.
+        elevenlabs::MODEL_ID => Some(0.22 / 60.0),
         _ => None,
     }
 }

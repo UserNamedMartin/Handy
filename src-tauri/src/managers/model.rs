@@ -36,10 +36,13 @@ pub enum EngineType {
     GigaAM,
     Canary,
     Cohere,
-    /// Google Gemini 3.5 Transcribe, over the network. The only non-local
-    /// engine: nothing is downloaded and nothing runs on this machine — see
-    /// [`crate::cloud::gemini`].
+    /// Google Gemini 3.5 Transcribe, over the network. Nothing is downloaded
+    /// and nothing runs on this machine — see [`crate::cloud::gemini`].
     Gemini,
+    /// ElevenLabs Scribe v2, over the network — see
+    /// [`crate::cloud::elevenlabs`]. Same deal as [`EngineType::Gemini`]: an
+    /// HTTP client, not a model.
+    ElevenLabs,
 }
 
 /// Where a model comes from and how Handy obtains it — the routing discriminant
@@ -1211,6 +1214,49 @@ impl ModelManager {
                 supports_language_selection: true,
                 is_custom: false,
                 supports_streaming: true,
+                supports_language_detection: true,
+            },
+        );
+
+        // Scribe v2 covers 90+ locales; this is the subset Handy already knows
+        // how to name, which is what the language picker can display.
+        let elevenlabs_languages: Vec<String> = gemini_languages.clone();
+
+        available_models.insert(
+            crate::cloud::elevenlabs::MODEL_ID.to_string(),
+            ModelInfo {
+                id: crate::cloud::elevenlabs::MODEL_ID.to_string(),
+                name: "ElevenLabs Scribe v2".to_string(),
+                description:
+                    "ElevenLabs' cloud speech-to-text. The most accurate option measured on this \
+                     machine's own dictations, and cheaper than Gemini. Needs an API key, an \
+                     internet connection, and sends your audio to ElevenLabs."
+                        .to_string(),
+                filename: crate::cloud::elevenlabs::MODEL_ID.to_string(),
+                source: ModelSource::Cloud {
+                    provider: crate::cloud::elevenlabs::PROVIDER_ID.to_string(),
+                },
+                size_mb: 0,
+                is_downloaded: true,
+                is_downloading: false,
+                partial_size: 0,
+                is_directory: false,
+                engine_type: EngineType::ElevenLabs,
+                // Scored on the fork's own 10-clip Russian/English set against a
+                // Gemini 3.1 Pro reference: 10.8% WER vs 14.4% for Gemini batch
+                // and 15.9% for Gemini Live. Ahead of both, so it ranks above
+                // them here — but this is one machine's audio, not a benchmark.
+                accuracy_score: 0.97,
+                // 1.2-3.8 s per dictation, against Gemini batch's 3.0-4.8 s.
+                speed_score: 0.88,
+                supports_translation: false,
+                is_recommended: false,
+                supported_languages: elevenlabs_languages,
+                supports_language_selection: true,
+                is_custom: false,
+                // Their streaming model exists (`scribe_v2_realtime`) and is not
+                // offered: 30.3% WER on the same set, three times this one's.
+                supports_streaming: false,
                 supports_language_detection: true,
             },
         );

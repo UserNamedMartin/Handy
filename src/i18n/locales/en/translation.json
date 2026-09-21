@@ -254,7 +254,8 @@
         "diarizationHint": "Tag each segment with a speaker. Up to 8, though Google marks 3+ experimental.",
         "timestamps": "Word timestamps",
         "timestampsHint": "Millisecond offsets per word. Google notes this degrades accuracy.",
-        "needsVerbatim": "Requires Verbatim mode — Google does not allow this with Smart."
+        "needsVerbatim": "Requires Verbatim mode — Google does not allow this with Smart.",
+        "apiKeyHintElevenLabs": "From the ElevenLabs dashboard. Stored locally and never committed; audio is sent to ElevenLabs while this model is selected."
       }
     },
     "sound": {
