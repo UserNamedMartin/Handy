@@ -11,10 +11,9 @@
 
 use anyhow::{anyhow, Result};
 use base64::Engine as _;
-use log::debug;
+use log::{debug, warn};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::io::Cursor;
 use std::time::Duration;
 
 use crate::settings::{GeminiTranscribeMode, GeminiTranscribeSettings};
@@ -55,15 +54,38 @@ const SAMPLE_RATE: u32 = 16_000;
 
 /// Google's cap on inline (base64) request bodies is 20 MB. We encode 16-bit
 /// PCM at 16 kHz mono — 32 kB per second of audio, ~42.7 kB after base64 — so
-/// this budget is worth roughly seven minutes of speech. Longer clips need the
-/// Files API instead of an inline body; until that lands we fail with a clear
-/// message rather than letting the request bounce off Google with a 400.
+/// this budget is worth roughly seven minutes of speech. Anything longer goes
+/// through [`GeminiTranscriber::upload_wav`] instead, which has no such limit.
 const MAX_INLINE_BYTES: usize = 18 * 1024 * 1024;
+
+/// Resumable-upload entry point of the Files API.
+const UPLOAD_URL: &str = "https://generativelanguage.googleapis.com/upload/v1beta/files";
+
+/// Base for addressing an uploaded file by its `files/<id>` name.
+const FILES_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
+
+/// The only container we ever send.
+const WAV_MIME: &str = "audio/wav";
 
 /// Google's documented ceiling on acoustic biasing terms. Their guidance is
 /// that ~100 works best and more starts to dilute; we only enforce the hard cap
 /// so a large `custom_words` list can never 400 the request.
 const MAX_CUSTOM_VOCABULARY: usize = 1000;
+
+/// A file the Files API is holding for us.
+struct UploadedFile {
+    uri: String,
+    /// `files/<id>`, which is how a delete addresses it.
+    name: String,
+}
+
+/// Where the audio for a request lives.
+enum AudioRef {
+    /// Base64 in the request body. One round trip, capped at 20 MB.
+    Inline(String),
+    /// Uploaded first and referenced by URI. No length limit.
+    Uploaded(UploadedFile),
+}
 
 /// A cloud "engine". Holds no model — just the HTTP client and the credentials
 /// and model id it was configured with.
@@ -110,26 +132,34 @@ impl GeminiTranscriber {
             return Ok(String::new());
         }
 
-        let wav = encode_wav(audio)?;
+        let wav = super::encode_wav_16k(audio)?;
         let encoded = base64::engine::general_purpose::STANDARD.encode(&wav);
+        let seconds = audio.len() as f64 / SAMPLE_RATE as f64;
 
-        if encoded.len() > MAX_INLINE_BYTES {
-            let seconds = audio.len() as f64 / SAMPLE_RATE as f64;
-            return Err(anyhow!(
-                "Recording is too long for cloud transcription ({:.0}s). \
-                 Gemini accepts about 7 minutes per inline request; \
-                 use a local model for clips this long.",
+        // A clip that does not fit inline is uploaded rather than refused. This
+        // used to be a hard error at roughly seven minutes, which also made the
+        // history screen's re-transcribe button useless on exactly the long
+        // dictations most worth recovering.
+        let audio_ref = if encoded.len() > MAX_INLINE_BYTES {
+            debug!(
+                "Gemini transcribe: {:.1}s of audio exceeds the inline budget; uploading",
                 seconds
-            ));
-        }
+            );
+            AudioRef::Uploaded(self.upload_wav(&wav)?)
+        } else {
+            AudioRef::Inline(encoded)
+        };
 
-        let body = self.build_request(&encoded, config, language, custom_words);
+        let body = self.build_request(&audio_ref, config, language, custom_words);
 
         debug!(
-            "Gemini transcribe: model={}, audio={:.1}s, payload={} KB",
+            "Gemini transcribe: model={}, audio={:.1}s, via={}",
             self.model,
-            audio.len() as f64 / SAMPLE_RATE as f64,
-            encoded.len() / 1024
+            seconds,
+            match &audio_ref {
+                AudioRef::Inline(data) => format!("inline {} KB", data.len() / 1024),
+                AudioRef::Uploaded(file) => format!("upload {}", file.name),
+            }
         );
 
         let request = self
@@ -160,14 +190,119 @@ impl GeminiTranscriber {
             }
 
             Ok(text)
+        });
+
+        // Delete before unwrapping the result: the file is ours either way, and
+        // a failed transcription should not leave it behind.
+        if let AudioRef::Uploaded(file) = &audio_ref {
+            self.delete_file(&file.name);
+        }
+
+        extract_transcript(&response?)
+    }
+
+    /// Hand the WAV to the Files API and return the handle to reference it by.
+    ///
+    /// Two round trips — open the session, then send the bytes — measured at
+    /// 1.9 s for a 14 MB (7.5 minute) clip against 7 s for the transcription
+    /// itself, so it is only worth doing for clips that cannot go inline.
+    /// Uploads expire on the service after 48 h; we delete ours immediately
+    /// after use anyway.
+    fn upload_wav(&self, wav: &[u8]) -> Result<UploadedFile> {
+        let start = self
+            .client
+            .post(UPLOAD_URL)
+            .header("x-goog-api-key", &self.api_key)
+            .header("X-Goog-Upload-Protocol", "resumable")
+            .header("X-Goog-Upload-Command", "start")
+            .header("X-Goog-Upload-Header-Content-Length", wav.len().to_string())
+            .header("X-Goog-Upload-Header-Content-Type", WAV_MIME)
+            .json(&json!({ "file": { "display_name": "handy-dictation" } }));
+
+        // The URL comes back in a header and already carries the credentials,
+        // so the second leg needs no key of its own.
+        let upload_url = crate::cloud::block_on(async move {
+            let response = start
+                .send()
+                .await
+                .map_err(|e| anyhow!("Gemini upload could not start: {}", e))?;
+            let status = response.status();
+            let url = response
+                .headers()
+                .get("x-goog-upload-url")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+
+            match url {
+                Some(url) if status.is_success() => Ok(url),
+                _ => {
+                    let text = response.text().await.unwrap_or_default();
+                    Err(anyhow!(
+                        "Gemini upload could not start ({}): {}",
+                        status,
+                        describe_api_error(&text)
+                    ))
+                }
+            }
         })?;
 
-        extract_transcript(&response)
+        let finish = self
+            .client
+            .post(upload_url)
+            .header("Content-Length", wav.len().to_string())
+            .header("X-Goog-Upload-Offset", "0")
+            .header("X-Goog-Upload-Command", "upload, finalize")
+            .body(wav.to_vec());
+
+        crate::cloud::block_on(async move {
+            let response = finish
+                .send()
+                .await
+                .map_err(|e| anyhow!("Gemini upload failed: {}", e))?;
+            let status = response.status();
+            let text = response
+                .text()
+                .await
+                .map_err(|e| anyhow!("Failed to read the Gemini upload response: {}", e))?;
+
+            if !status.is_success() {
+                return Err(anyhow!(
+                    "Gemini upload returned {}: {}",
+                    status,
+                    describe_api_error(&text)
+                ));
+            }
+
+            parse_uploaded_file(&text)
+        })
+    }
+
+    /// Best-effort cleanup — the service expires uploads on its own, so a
+    /// failure here costs a log line and nothing else.
+    fn delete_file(&self, name: &str) {
+        let request = self
+            .client
+            .delete(format!("{}/{}", FILES_BASE, name))
+            .header("x-goog-api-key", &self.api_key);
+
+        let outcome = crate::cloud::block_on(async move {
+            request
+                .send()
+                .await
+                .map_err(|e| anyhow!("{}", e))
+                .map(|response| response.status())
+        });
+
+        match outcome {
+            Ok(status) if status.is_success() => {}
+            Ok(status) => warn!("Gemini: deleting the uploaded audio returned {}", status),
+            Err(e) => warn!("Gemini: could not delete the uploaded audio: {}", e),
+        }
     }
 
     fn build_request(
         &self,
-        encoded_audio: &str,
+        audio: &AudioRef,
         config: &GeminiTranscribeSettings,
         language: &str,
         custom_words: &[String],
@@ -186,18 +321,56 @@ impl GeminiTranscriber {
 
         transcription_config.insert("mode".to_string(), build_mode(config));
 
+        // `uri` is the field the Interactions API accepts for an uploaded file;
+        // `file_uri` and `file_data`, which the rest of the Gemini surface
+        // uses, are both rejected as unknown parameters here.
+        let input = match audio {
+            AudioRef::Inline(data) => json!({
+                "type": "audio",
+                "data": data,
+                "mime_type": WAV_MIME,
+            }),
+            AudioRef::Uploaded(file) => json!({
+                "type": "audio",
+                "uri": file.uri,
+                "mime_type": WAV_MIME,
+            }),
+        };
+
         json!({
             "model": self.model,
-            "input": [{
-                "type": "audio",
-                "data": encoded_audio,
-                "mime_type": "audio/wav",
-            }],
+            "input": [input],
             "generation_config": {
                 "transcription_config": Value::Object(transcription_config),
             },
         })
     }
+}
+
+/// Pull the handle out of an upload response.
+///
+/// The payload is wrapped in a `file` object, and `uri` is the absolute URL the
+/// transcription request wants while `name` (`files/<id>`) is what a delete
+/// addresses — so both are kept.
+fn parse_uploaded_file(body: &str) -> Result<UploadedFile> {
+    let value: Value = serde_json::from_str(body)
+        .map_err(|e| anyhow!("Gemini upload returned unparseable JSON: {}", e))?;
+    let file = value
+        .get("file")
+        .ok_or_else(|| anyhow!("Gemini upload response had no 'file'"))?;
+
+    let field = |name: &str| {
+        file.get(name)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("Gemini upload response had no '{}'", name))
+    };
+
+    Ok(UploadedFile {
+        uri: field("uri")?,
+        name: field("name")?,
+    })
 }
 
 /// Build the `mode` object.
@@ -271,38 +444,6 @@ pub(super) fn resolve_custom_vocabulary(
     terms
 }
 
-/// Encode 16 kHz mono f32 samples as an in-memory 16-bit PCM WAV.
-///
-/// `audio/wav` is on Gemini's accepted MIME list and `hound` is already a
-/// dependency, so this costs nothing. FLAC would halve the upload, which is
-/// worth revisiting if payload time ever shows up in the timings.
-fn encode_wav(audio: &[f32]) -> Result<Vec<u8>> {
-    let spec = hound::WavSpec {
-        channels: 1,
-        sample_rate: SAMPLE_RATE,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-
-    let mut buffer = Cursor::new(Vec::with_capacity(audio.len() * 2 + 44));
-    {
-        let mut writer = hound::WavWriter::new(&mut buffer, spec)
-            .map_err(|e| anyhow!("Failed to start WAV encoding: {}", e))?;
-        for sample in audio {
-            // Clamp before scaling: the recorder's auto-gain can push a boosted
-            // whisper right up to full scale, and an out-of-range cast wraps.
-            let clamped = sample.clamp(-1.0, 1.0);
-            writer
-                .write_sample((clamped * i16::MAX as f32) as i16)
-                .map_err(|e| anyhow!("Failed to encode WAV sample: {}", e))?;
-        }
-        writer
-            .finalize()
-            .map_err(|e| anyhow!("Failed to finalize WAV encoding: {}", e))?;
-    }
-
-    Ok(buffer.into_inner())
-}
 
 #[derive(Deserialize)]
 struct InteractionResponse {
@@ -379,6 +520,43 @@ fn truncate(body: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn uploaded_file_keeps_both_the_uri_and_the_name() {
+        let parsed = parse_uploaded_file(
+            r#"{"file":{"name":"files/abc123","uri":"https://x/v1beta/files/abc123","state":"ACTIVE"}}"#,
+        )
+        .expect("parse");
+        assert_eq!(parsed.name, "files/abc123");
+        assert_eq!(parsed.uri, "https://x/v1beta/files/abc123");
+    }
+
+    #[test]
+    fn an_upload_response_without_a_uri_is_an_error() {
+        // Failing here is better than sending a request whose audio field is
+        // silently empty, which the service answers with an empty transcript.
+        assert!(parse_uploaded_file(r#"{"file":{"name":"files/abc123"}}"#).is_err());
+        assert!(parse_uploaded_file(r#"{"name":"files/abc123"}"#).is_err());
+    }
+
+    #[test]
+    fn an_uploaded_reference_is_sent_as_uri_not_as_data() {
+        let engine = GeminiTranscriber::new("k".into(), MODEL_ID.into()).expect("engine");
+        let body = engine.build_request(
+            &AudioRef::Uploaded(UploadedFile {
+                uri: "https://x/v1beta/files/abc".into(),
+                name: "files/abc".into(),
+            }),
+            &GeminiTranscribeSettings::default(),
+            "auto",
+            &[],
+        );
+        let input = &body["input"][0];
+        assert_eq!(input["uri"], "https://x/v1beta/files/abc");
+        assert_eq!(input["mime_type"], WAV_MIME);
+        assert!(input.get("data").is_none());
+        assert!(input.get("file_uri").is_none());
+    }
+
     use super::*;
 
     fn config() -> GeminiTranscribeSettings {
@@ -487,7 +665,7 @@ mod tests {
 
     #[test]
     fn wav_encoding_produces_a_riff_header() {
-        let wav = encode_wav(&[0.0, 0.5, -0.5]).unwrap();
+        let wav = crate::cloud::encode_wav_16k(&[0.0, 0.5, -0.5]).unwrap();
         assert_eq!(&wav[0..4], b"RIFF");
         assert_eq!(&wav[8..12], b"WAVE");
     }
