@@ -72,6 +72,50 @@ second tap does not, latch locks a live hold, cancel clears a pending window, an
 `next_deadline` picks the nearer timer. Upstream's coordinator tests still pass
 unchanged.
 
+### ElevenLabs Scribe v2 as a second cloud backend
+
+`src-tauri/src/cloud/elevenlabs.rs` — a second cloud engine alongside Gemini,
+same shape: no model to load, one multipart POST per utterance, plain sync
+`transcribe`. Touch points are deliberately few: `EngineType::ElevenLabs` +
+a catalog entry (`managers/model.rs`), a `LoadedEngine` variant with its load
+and transcribe arms (`managers/transcription.rs`), a price in
+`cloud::usd_per_minute` (which is also what makes `engine_kind` report "cloud",
+and therefore what disables the VAD gate for it), and an API-key row in the
+settings card. `encode_wav_16k` moved from `gemini.rs` up to `cloud/mod.rs`
+because both backends now need it. Needs reqwest's `multipart` feature.
+
+**Why this model and not their streaming one.** Measured on 10 real dictations
+from this machine (Russian with English terms, through the METADOX VEKTA mask)
+against a Gemini 3.1 Pro reference transcript, word-level WER ignoring
+punctuation:
+
+| model | WER | per-clip wait | $/hour |
+|---|---|---|---|
+| ElevenLabs Scribe v2 (batch) | **10.8%** | 1.2-3.8 s | $0.22 |
+| Gemini 3.5 Transcribe (batch) | 14.4% | 3.0-4.8 s | ~$0.30 |
+| Gemini 3.5 Transcribe Live | 15.9% | 0.2-0.5 s | $0.54 |
+| ElevenLabs Scribe v2 Realtime | 30.3% | — | $0.39 |
+
+`scribe_v2_realtime` is three times worse than its own batch sibling here and
+mangles exactly the code-switched terms this setup exists to get right ("в
+треде" → "в Телеге", "Грише" → "Криштофу"). Two hypotheses were tested and
+neither rescued it: feeding at true 1x pacing rather than as fast as the socket
+takes it (identical, 30.3%), and lifting the quiet mask audio by 18 dB
+(33.6% → 28.8% on a 3-clip subset). A `commit_strategy=vad` run was worse still
+(82% — it committed almost nothing). So it is not offered in the catalog.
+
+Note this is the opposite of the public ranking: Artificial Analysis puts
+Scribe v2 Realtime 3rd in the world on AA-WER Streaming, ahead of Gemini Live.
+Their benchmark is three English datasets. It does not describe this use case,
+and that gap is the reason the fork keeps its own corpus.
+
+**Deliberately not sent:** `keyterms`. ElevenLabs bills keyterm prompting as a
+paid add-on, and Handy's fuzzy post-correction already covers custom words, so
+`custom_words_sent_to_model` stays false for this engine and the corrector runs.
+`tag_audio_events` is forced off — Scribe annotates "(laughter)" by default, and
+a dictation goes straight into the cursor, where an annotation is a typo the
+user has to delete.
+
 ### Other local fixes
 - **Fullscreen-aware overlay position** (`src-tauri/src/overlay.rs`): the bottom anchor used only macOS `work_area`, which a background app is handed as the *desktop's* Dock-reserved frame even when another app is in fullscreen — so the pill floated up "as if the Dock were there." Fixed with `dock_state::dock_is_on_screen()` (hand-declared `CGWindowList` + `core-foundation` externs): ask the window server directly whether the Dock's tile-bar window (owner `"Dock"`, layer 20 = `kCGDockWindowLevel`) is currently on screen. No Dock on screen (fullscreen space or auto-hidden) → anchor to the physical screen bottom; Dock on screen → above it via `work_area`. This is **app-agnostic** — an earlier attempt used the Accessibility `AXFullScreen` attribute, which works for native apps but NOT Electron apps (Claude, ChatGPT), so their fullscreen still floated high; the CGWindowList check works for all. No screen-recording permission needed (metadata only). Added dep: `core-foundation` (macOS).
 - **Live overlay repositioning (animated glide)** (`src-tauri/src/overlay.rs`): while the overlay is visible, a ~60 fps loop (`start_overlay_reposition_loop` → `overlay_anim_tick`) **eases** the pill toward its target, so Dock/fullscreen changes mid-dictation glide instead of snapping. The target (the Dock check) is refreshed ~8×/sec; each frame `overlay_anim_tick` lerps `OVERLAY_ANIM.0` (current) → `.1` (target) at 0.30/frame and snaps within 0.5 px. `overlay_anim_snap_to` sets it instantly on show (appear in place) and clears it on hide. Gated by `OVERLAY_VISIBLE` + `OVERLAY_REPOSITION_GEN`. macOS only.
@@ -179,9 +223,9 @@ sends raw dictation audio to a third party.
   path only. Gemini transcribes that same faint whisper perfectly when given it.
   `activityEnd` must never overtake queued audio — safe here because `Outbound`
   is FIFO through the single socket-writing loop.
-- **`generationComplete` fires after every finalized chunk** (seven times on an
-  89 s dictation), so on its own it means "that sentence is done". It only means
-  "the turn is done" *after* `audioStreamEnd` — that is the end signal, and it
+- **`generationComplete` fires after every finalized chunk**, so on its own it
+  means "that sentence is done". It only means "the turn is done" *after*
+  `audioStreamEnd` — that is the end signal, and it
   lands with the tail at ~end+0.35 s. Getting this wrong in either direction
   costs real damage: treating it as unconditional truncated an 89 s dictation to
   48 characters; ignoring it entirely forced a 600 ms idle-timeout on every
@@ -222,6 +266,97 @@ which is most of what dictation is for here. The key may also come from `HANDY_G
 for headless runs; the stored setting wins. `custom_words_sent_to_model` now
 gates the fuzzy post-corrector — running it on top of `custom_vocabulary` would
 replace a term the model already got right with a near-miss from the same list.
+
+### The Live ceiling at ~221.8 s, and why long dictations go to batch
+**Measured, not documented.** Five real clips (234, 254, 283, 451, 637 s) driven
+through the real streaming worker each delivered their one and only finalized
+chunk at **221.6-221.9 s**, with the last interim a second or two earlier — and
+then the service went **completely silent while the client kept streaming**
+audio into it (the 637 s run was still sending at ~610 s). Everything after
+~3 min 42 s was simply never sent to us. Before this was found, **every
+dictation over that length had been silently losing its tail since the fork
+moved to Live** — 12 dictations and ~18.7 minutes of speech by the time it was
+measured, and clips of 4-4.7 minutes that looked complete by character density
+were cut too.
+
+What the numbers rule out:
+- Not the documented limits. Google states audio-only sessions run 15 min
+  without compression, connections ~10 min, and the `gemini-3.5-transcribe-live`
+  page says "continuous streaming for up to 10 minutes". No per-turn limit is
+  documented anywhere.
+- Not an output-token cap: final-chunk sizes varied 3731-4480 bytes while the
+  *time* stayed constant to within 0.3 s.
+- Not a message cap: rolling the activity cut the interim count from ~457 to 310
+  and the wall did not move.
+- **Not the context window.** `contextWindowCompression: {slidingWindow:{}}` —
+  Google's documented lever for exactly this — changed nothing: same 221.8 s,
+  byte-identical transcript.
+- **Not per activity.** Closing and re-opening the activity mid-stream
+  (`activityEnd` + `activityStart` on the same socket) did not move the wall
+  *and lost turns*: four activities produced two finals, 1514 chars against 2441
+  without it.
+- A fresh connection always gets its own full budget, so the ceiling is **per
+  connection**.
+
+Google's own Jot is no help here: its setup frame is identical to ours — same
+`inputAudioTranscription`, same `automaticActivityDetection: {disabled: true}`,
+no `maxOutputTokens`, no compression, no session resumption — and it brackets
+the turn the same way, with no rollover logic at all. Its 9:00 warning and 10:00
+hard stop are aimed at the documented limit, so it hits this wall too.
+
+**What the fork does instead: no seam.** `TRANSCRIPTION_CAP` (210 s, deliberately
+below the measurement) is checked at finalize. Past it the worker reports
+`StreamOutcome::RedoInBatch { billed_secs }`, the partial transcript is
+**discarded**, and `actions.rs` re-transcribes the **whole recording** in batch.
+Re-doing everything rather than the remainder is the point: there is no boundary,
+so no word can be cut or duplicated at one. Measured on the 451 s dictation:
+2291 chars before, **4906 after** (4932 is the independent reference), and the
+whole thing lands ~14 s after key release instead of instantly. Dictations under
+the ceiling are untouched and still instant.
+
+The experiment code is gone; the findings above are what is left of it. If you
+want to re-run any of it, the shape was one env-gated field in `build_setup` and
+one counter in the audio arm of `session()`. **The ceiling is an observation that
+can change under us** — Google documents ten times as much — so if long
+dictations start coming back whole from the socket, this is the number to
+re-measure.
+
+### Long audio: the Files API, not an inline body
+`cloud/gemini.rs` uploads any clip that does not fit the 18 MB inline budget
+(~7 minutes) and references it by URI instead of refusing it. This used to be a
+hard error, which also made the history screen's re-transcribe button useless on
+exactly the long dictations most worth recovering — and the button reported it as
+"Failed to re-transcribe. Please try again.", because `handleRetranscribe`
+throws the real message into the WebView console.
+
+Two traps found by probing, not by reading:
+- The Interactions API wants **`uri`**. `file_uri` and `file_data` — what the
+  rest of the Gemini surface uses — both come back as
+  `Unknown parameter at 'input[0]'`, and `"type": "file"` is rejected outright.
+- The upload is the standard resumable two-step (`X-Goog-Upload-Command: start`,
+  then `upload, finalize`), and the URL returned in `x-goog-upload-url` already
+  carries the credentials, so the second leg needs no key of its own.
+
+Measured: 14 MB (7.5 min) uploads in 1.9 s against ~7 s for the transcription,
+so inline stays the path for clips that fit. Uploads expire server-side after
+48 h; we delete ours immediately after use, before unwrapping the transcription
+result, so a failed request leaves nothing behind.
+
+### The usage ledger now sees every billed request
+Two kinds of spend used to be invisible, both of them the expensive kind:
+- **A discarded Live attempt.** A dictation past the ceiling pays for Live *and*
+  batch. `record_discarded_usage` in `actions.rs` appends the Live half via
+  `HistoryManager::record_usage`, so the report shows both.
+- **Re-transcription.** `retry_history_entry_transcription` spent money with no
+  ledger row at all — a long dictation re-transcribed a few times cost real
+  cents the usage screen never showed. It now records its own row, with a cost
+  only when the request produced a transcript (matching what the dictation path
+  does with a failure).
+
+`dictation_usage` also takes `via_batch` now: selecting the Live model and then
+transcribing without a socket bills the **batch** model at the batch rate, and
+`cloud::batch_sibling` is what maps one to the other. Before this the ledger
+charged $0.009/min for requests that cost $0.005.
 
 ### Reference: Google's own Gemini dictation client
 `google-gemini/jot-gemini-transcribe-macOS` ("Jot") is an open-source macOS
@@ -539,16 +674,14 @@ safe (regenerated on rebuild; keeps the compile cache) — but keep the rest of 
 
 Written down because each one has already cost time to rediscover.
 
-- **A Live session dies at ~10 minutes and ships the fragment as if complete.**
-  Google sends `GoAway` first — the string appears nowhere in this repo, so it is
-  ignored — then aborts the socket. `SESSION_DEADLINE` is 15 min, *above*
-  Google's cap, so the client's own ceiling can never fire first. The worker sets
-  `failed`, logs it, and ignores it: the batch fallback only triggers on an
-  *empty* result, so a 10.6-minute dictation once pasted a third of itself with
-  no warning. Batch is not a usable fallback there either — it refuses clips over
-  ~7 minutes. Recovery that works by hand: split the WAV at a silence, batch each
-  half, join. Jot's answer to the same limit is a soft warning at 9:00 and a hard
-  stop plus transcribe at 10:00; no reconnection.
+- **`GoAway` is still ignored, and a session past ~10 minutes is still killed
+  for it.** Google sends `GoAway` and then aborts the socket with close code
+  1008, reason *"the client failed to close the connection after receiving a
+  GoAway signal once the session durat..."* — the reason string is in the log
+  now, but nothing acts on the warning. It no longer costs a transcript (the
+  ceiling below sends every long dictation to batch long before this fires), so
+  it is a loose end rather than a bug. `SESSION_DEADLINE` (15 min) is above
+  Google's own cap and can therefore never fire first.
 - **A cancelled cloud transcription is still paid for.** Cancel abandons the
   pipeline rather than aborting it, so the request in flight runs to completion
   and is billed. Nothing user-visible depends on it.
@@ -556,6 +689,11 @@ Written down because each one has already cost time to rediscover.
   pill. It opens from text arriving rather than from a state change, so the
   window cannot be grown in time; it needs an open/collapse event from the
   frontend.
+- **A Live session is billed for audio it silently stops transcribing.** The
+  ceiling documented below means the provider is paid for the whole dictation
+  and only the first ~3.5 minutes of it is usable, so a long dictation now costs
+  a Live request *and* a batch one. Both are in the ledger; the Live half is
+  waste that only reconnection could recover.
 - **SMART mode rewrites speech**, which is why `verbatim` is the mode to use. The
   better fix is Jot's `ValidationGate` shape — take both the raw and the cleaned
   text and fall back to raw when they diverge — rather than giving up cleanup
