@@ -116,6 +116,21 @@ pub fn estimate_cost_usd(model_id: &str, duration_secs: f64) -> Option<f64> {
     usd_per_minute(model_id).map(|rate| rate * duration_secs / 60.0)
 }
 
+/// The model that actually serves a *non-streaming* request for `model_id`.
+///
+/// Selecting the Live model and then transcribing a file — the history screen's
+/// re-transcribe button, or the fallback for a dictation past
+/// [`gemini_live::TRANSCRIPTION_CAP`] — loads the batch engine, because Live
+/// only exists as a socket. The ledger has to say which model was billed, and
+/// at which rate: Live is $0.009/min against batch's $0.005.
+pub fn batch_sibling(model_id: &str) -> &str {
+    if model_id == gemini_live::LIVE_MODEL_ID {
+        gemini::MODEL_ID
+    } else {
+        model_id
+    }
+}
+
 /// Which side of the local/cloud split a model sits on — the grouping key the
 /// usage screen uses, and stable across catalog renames.
 pub fn engine_kind(model_id: &str) -> &'static str {
@@ -133,6 +148,17 @@ mod tests {
     #[test]
     fn local_models_are_free_and_labelled_local() {
         assert_eq!(usd_per_minute("whisper-large-v3"), None);
+    }
+
+    #[test]
+    fn the_live_model_bills_as_batch_when_it_is_not_streaming() {
+        assert_eq!(
+            batch_sibling(gemini_live::LIVE_MODEL_ID),
+            gemini::MODEL_ID
+        );
+        // Everything else is served by the model it names.
+        assert_eq!(batch_sibling(gemini::MODEL_ID), gemini::MODEL_ID);
+        assert_eq!(batch_sibling("whisper-large-v3"), "whisper-large-v3");
         assert_eq!(estimate_cost_usd("whisper-large-v3", 600.0), None);
         assert_eq!(engine_kind("whisper-large-v3"), "local");
     }

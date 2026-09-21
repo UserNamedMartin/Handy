@@ -183,6 +183,11 @@ pub enum StreamOutcome {
     Silent,
     /// No stream ran, or it broke. Batch-transcribe the audio instead.
     UseBatch,
+    /// A cloud session ran, was billed for `billed_secs` of audio, and stopped
+    /// transcribing before the end of it. Its text is a fragment: re-do the
+    /// *whole* recording in batch rather than trying to continue from where it
+    /// stopped, so no seam exists to lose or duplicate a word at.
+    RedoInBatch { billed_secs: f64 },
 }
 
 struct FinalizedStreamText {
@@ -196,6 +201,10 @@ struct FinalizedStreamText {
     /// same provider for the same nothing, costing another ~3 s and another
     /// billed request.
     nothing_said: bool,
+    /// Set when the session was billed for audio it did not finish
+    /// transcribing: the seconds to charge for the attempt we are about to
+    /// throw away. `None` whenever the text is usable.
+    discarded_billed_secs: Option<f64>,
 }
 
 /// Routes real-time audio frames to the active streaming worker. Shared between
@@ -1190,6 +1199,7 @@ impl TranscriptionManager {
                                 };
                                 Some(FinalizedStreamText {
                                     nothing_said: false,
+                                    discarded_billed_secs: None,
                                     text: stream.text().full,
                                     output_language,
                                     supported_languages: languages.clone(),
@@ -1479,6 +1489,14 @@ impl TranscriptionManager {
             }
         };
 
+        if let Some(billed_secs) = finalized.discarded_billed_secs {
+            // The fragment is deliberately dropped here rather than post-
+            // processed: it is the caller that re-does the audio, and the
+            // caller that has to bill for this attempt as well.
+            self.maybe_unload_immediately("streaming transcription");
+            return Ok(StreamOutcome::RedoInBatch { billed_secs });
+        }
+
         if finalized.nothing_said {
             // Healthy session, no speech in it. There is nothing for batch to
             // find either, so end here instead of paying for a second look.
@@ -1650,15 +1668,48 @@ impl TranscriptionManager {
                         }
                     }
                     let text = join_finals(&finals);
+                    // Only finalized chunks are kept, so a hypothesis that was
+                    // received and never finalized is lost. The number matters:
+                    // it separates "the service stopped talking to us" from
+                    // "the service was still talking and we threw it away".
+                    if !tentative.trim().is_empty() {
+                        debug!(
+                            "Gemini Live: last unfinalized hypothesis was {} bytes; only finalized chunks are kept",
+                            tentative.len()
+                        );
+                    }
                     info!(
-                        "Gemini Live: {} chunk(s), {} chars for {:.2}s of audio{}",
+                        "Gemini Live: {} chunk(s), {} chars for {:.2}s of audio; {} interim update(s), last at {:.1}s{}",
                         finals.len(),
                         text.len(),
                         fed.as_secs_f64(),
+                        interim_count.get(),
+                        last_interim_at.get(),
                         if failed { " (session reported an error)" } else { "" }
                     );
                     // The cloud model detects the language itself and reports
                     // none back, so the transcript is all the evidence there is.
+                    // Past the service's ceiling the transcript is a fragment
+                    // whatever it looks like — it stops where the service
+                    // stopped answering, mid-sentence, with no error anywhere.
+                    // Shipping it is how a 7.5-minute dictation pasted half of
+                    // itself and looked fine.
+                    if fed > crate::cloud::gemini_live::TRANSCRIPTION_CAP {
+                        warn!(
+                            "Gemini Live: {:.1}s of audio is past the {}s ceiling where the service stops transcribing; discarding the partial transcript and re-doing the whole recording in batch",
+                            fed.as_secs_f64(),
+                            crate::cloud::gemini_live::TRANSCRIPTION_CAP.as_secs()
+                        );
+                        let _ = reply.send(Some(FinalizedStreamText {
+                            text,
+                            output_language: OutputLanguageEvidence::Unknown,
+                            supported_languages: Vec::new(),
+                            nothing_said: false,
+                            discarded_billed_secs: Some(fed.as_secs_f64()),
+                        }));
+                        break;
+                    }
+
                     let _ = reply.send(stream_outcome(
                         text,
                         failed,
@@ -2443,6 +2494,7 @@ fn stream_reply(
         output_language,
         supported_languages,
         nothing_said: false,
+        discarded_billed_secs: None,
     })
 }
 
@@ -2473,6 +2525,7 @@ fn stream_outcome(
         output_language,
         supported_languages,
         nothing_said: true,
+        discarded_billed_secs: None,
     })
 }
 

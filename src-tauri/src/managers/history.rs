@@ -480,6 +480,35 @@ impl HistoryManager {
         Ok(entry_id)
     }
 
+    /// Append one row to the usage ledger on its own, with no history entry
+    /// beside it.
+    ///
+    /// Not every billed request produces a dictation to attach to: a Live
+    /// session that hit the service's ceiling is thrown away and re-done in
+    /// batch, and the history screen's re-transcribe button spends money on a
+    /// recording whose row already exists. Both used to be invisible, which
+    /// makes the spend report quietly wrong in the direction that matters.
+    pub fn record_usage(&self, usage: &DictationUsage) -> Result<()> {
+        Self::record_usage_with_conn(&self.get_connection()?, usage)
+    }
+
+    /// The SQL behind [`HistoryManager::record_usage`], split out so a test can
+    /// reach it without an app handle.
+    fn record_usage_with_conn(conn: &Connection, usage: &DictationUsage) -> Result<()> {
+        conn.execute(
+            "INSERT INTO usage_events (timestamp, duration_ms, model_id, engine, cost_usd)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                Utc::now().timestamp(),
+                usage.duration_ms,
+                &usage.model_id,
+                &usage.engine,
+                usage.cost_usd,
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Save a new history entry to the database.
     /// The WAV file should already have been written to the recordings directory.
     pub fn save_entry(
@@ -1040,6 +1069,42 @@ mod tests {
     /// was looked at, and eventually vanished — on a real store, 2026-08-31 went
     /// from 61 dictations / 25.6 min to 3 / 11.1 min within hours, and the three
     /// survivors were the hand-starred rows that pruning spares.
+    #[test]
+    fn a_standalone_usage_row_is_appended_without_touching_history() {
+        // A billed request with no dictation of its own: a Live session past the
+        // service's ceiling, or the re-transcribe button. Both used to spend
+        // money the report never saw.
+        let conn = setup_conn();
+        insert_usage(&conn, 1_700_000_000, Some(5_000), Some(0.001));
+
+        HistoryManager::record_usage_with_conn(
+            &conn,
+            &DictationUsage {
+                duration_ms: Some(451_410),
+                model_id: Some("gemini-3.5-transcribe".to_string()),
+                engine: Some("cloud".to_string()),
+                cost_usd: Some(0.0376),
+            },
+        )
+        .expect("record usage");
+
+        let (rows, total): (i64, f64) = conn
+            .query_row(
+                "SELECT COUNT(*), ROUND(SUM(cost_usd), 4) FROM usage_events",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("read ledger");
+        assert_eq!(rows, 2, "the ledger row is appended, not merged");
+        assert!((total - 0.0386).abs() < 1e-6, "both costs are counted: {}", total);
+
+        // It is a ledger entry, not a dictation: nothing appears in history.
+        let entries: i64 = conn
+            .query_row("SELECT COUNT(*) FROM transcription_history", [], |r| r.get(0))
+            .expect("count history");
+        assert_eq!(entries, 0);
+    }
+
     #[test]
     fn pruning_history_does_not_change_the_usage_report() {
         let conn = setup_conn();

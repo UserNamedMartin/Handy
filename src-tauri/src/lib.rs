@@ -626,6 +626,24 @@ fn run_headless_transcription(app: &AppHandle, args: &CliArgs) -> i32 {
                     return 1;
                 }
             },
+            // The session was cut short by the service's transcription ceiling.
+            // Reported distinctly from `batch-fallback`, because a harness run
+            // needs to show *why* the stream was not used — this is the path a
+            // dictation over ~3.5 minutes now takes, and it is the one worth
+            // watching for regressions.
+            Ok(StreamOutcome::RedoInBatch { billed_secs }) => {
+                eprintln!(
+                    "[stream] service stopped transcribing before the end of {:.1}s of audio; re-doing it in batch",
+                    billed_secs
+                );
+                match tm.transcribe(samples.clone()) {
+                    Ok(t) => (t, "batch-after-cap"),
+                    Err(e) => {
+                        eprintln!("error: batch re-do after the streaming cap failed: {}", e);
+                        return 1;
+                    }
+                }
+            }
             Err(e) => {
                 eprintln!("error: finalize_stream failed: {}", e);
                 return 1;

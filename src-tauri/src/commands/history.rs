@@ -83,11 +83,40 @@ pub async fn retry_history_entry_transcription(
 
     transcription_manager.initiate_model_load();
 
+    // Billed on the audio it sends, so the ledger gets a row of its own. This
+    // used to spend money invisibly: re-transcribing a long dictation a few
+    // times cost real cents that the usage screen never showed.
+    let seconds = samples.len() as f64 / 16_000.0;
+
     let tm = Arc::clone(&transcription_manager);
     let transcription = tauri::async_runtime::spawn_blocking(move || tm.transcribe(samples))
         .await
-        .map_err(|e| format!("Transcription task panicked: {}", e))?
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("Transcription task panicked: {}", e))?;
+
+    // A model is only loaded once `transcribe` has run, so read it here rather
+    // than before — and read it whether or not the request succeeded, because a
+    // failed cloud request that reached the provider is still a request. Cost
+    // is charged only for a request that produced a transcript, matching what
+    // the dictation path does with a failed transcription.
+    let model_id = transcription_manager
+        .get_current_model()
+        .map(|id| crate::cloud::batch_sibling(&id).to_string());
+    if let Some(model_id) = model_id {
+        let usage = crate::managers::history::DictationUsage {
+            duration_ms: Some((seconds * 1000.0).round() as i64),
+            engine: Some(crate::cloud::engine_kind(&model_id).to_string()),
+            cost_usd: transcription
+                .as_ref()
+                .ok()
+                .and_then(|_| crate::cloud::estimate_cost_usd(&model_id, seconds)),
+            model_id: Some(model_id),
+        };
+        if let Err(err) = history_manager.record_usage(&usage) {
+            log::error!("Failed to record a re-transcription in the usage ledger: {}", err);
+        }
+    }
+
+    let transcription = transcription.map_err(|e| e.to_string())?;
 
     if transcription.is_empty() {
         return Err("Recording contains no speech".to_string());

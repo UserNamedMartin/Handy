@@ -92,6 +92,19 @@ pub fn tail_first_wait(audio: Duration) -> Duration {
 /// A socket that goes quiet mid-dictation must not strand the thread.
 const SESSION_DEADLINE: Duration = Duration::from_secs(15 * 60);
 
+/// How long one Live connection keeps transcribing before the service stops
+/// answering. Measured, not documented: five real clips (234-637 s) each
+/// delivered their last transcript at **221.6-221.9 s**, with the last interim
+/// a second or two earlier, and the socket then went silent while the client
+/// kept streaming audio into it. Neither sliding-window context compression nor
+/// closing and re-opening the activity on the same socket moved it, while a
+/// fresh connection always gets its own full budget — so the ceiling is per
+/// connection. Google documents 10 minutes for this model, so this number is an
+/// observation that may change under us; the margin below the measurement is
+/// deliberate, and being wrong by a few seconds only costs one extra batch
+/// request on a dictation that was already long.
+pub const TRANSCRIPTION_CAP: Duration = Duration::from_secs(210);
+
 /// What the worker thread reports back to the (synchronous) caller.
 #[derive(Debug)]
 pub enum LiveEvent {

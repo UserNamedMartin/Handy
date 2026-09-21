@@ -149,10 +149,15 @@ fn dictation_usage(
     tm: &crate::managers::transcription::TranscriptionManager,
     sample_count: usize,
     billed: bool,
+    via_batch: bool,
 ) -> crate::managers::history::DictationUsage {
     const SAMPLE_RATE: f64 = 16_000.0;
     let seconds = sample_count as f64 / SAMPLE_RATE;
-    let model_id = tm.get_current_model();
+    // Selecting the Live model and then transcribing without a socket bills the
+    // batch model at the batch rate, so the ledger must not keep saying "live".
+    let model_id = tm
+        .get_current_model()
+        .map(|id| if via_batch { crate::cloud::batch_sibling(&id).to_string() } else { id });
 
     let cost_usd = match (&model_id, billed) {
         (Some(id), true) => crate::cloud::estimate_cost_usd(id, seconds),
@@ -165,6 +170,28 @@ fn dictation_usage(
         model_id,
         engine,
         cost_usd,
+    }
+}
+
+/// Bill a provider request that produced nothing we kept.
+///
+/// A Live session past the service's ceiling is paid for and thrown away. The
+/// ledger is where spend is reconciled, so leaving it out would under-report
+/// exactly the dictations that cost the most.
+fn record_discarded_usage(
+    hm: &crate::managers::history::HistoryManager,
+    model_id: Option<String>,
+    seconds: f64,
+) {
+    let Some(model_id) = model_id else { return };
+    let usage = crate::managers::history::DictationUsage {
+        duration_ms: Some((seconds * 1000.0).round() as i64),
+        engine: Some(crate::cloud::engine_kind(&model_id).to_string()),
+        cost_usd: crate::cloud::estimate_cost_usd(&model_id, seconds),
+        model_id: Some(model_id),
+    };
+    if let Err(err) = hm.record_usage(&usage) {
+        error!("Failed to record a discarded transcription in the usage ledger: {}", err);
     }
 }
 
@@ -802,6 +829,9 @@ impl ShortcutAction for TranscribeAction {
                     // running, finalize it and use its text (all audio was already
                     // fed to the stream); otherwise batch-transcribe the samples.
                     let transcription_time = Instant::now();
+                    // Whether the text came from a file-based request rather
+                    // than from the socket, which decides who the ledger bills.
+                    let mut via_batch = false;
                     let transcription_result = match tm.finalize_stream() {
                         // Usable text wins. `UseBatch` (no active stream, or one
                         // that broke) re-does the same audio in batch, so a dead
@@ -817,8 +847,23 @@ impl ShortcutAction for TranscribeAction {
                         // transcript. That is a failure worth retrying, not
                         // silence — which is why the wait timer no longer decides
                         // anything a discard depends on.
-                        Ok(StreamOutcome::Silent) => tm.transcribe(samples),
-                        Ok(StreamOutcome::UseBatch) => tm.transcribe(samples),
+                        Ok(StreamOutcome::Silent) => {
+                            via_batch = true;
+                            tm.transcribe(samples)
+                        }
+                        Ok(StreamOutcome::UseBatch) => {
+                            via_batch = true;
+                            tm.transcribe(samples)
+                        }
+                        // The session stopped transcribing partway and was still
+                        // billed for everything it heard. Re-do the whole
+                        // recording — not the remainder, so there is no seam —
+                        // and put the wasted attempt in the ledger.
+                        Ok(StreamOutcome::RedoInBatch { billed_secs }) => {
+                            via_batch = true;
+                            record_discarded_usage(&hm, tm.get_current_model(), billed_secs);
+                            tm.transcribe(samples)
+                        }
                         Err(err) => Err(err),
                     };
 
@@ -953,7 +998,7 @@ impl ShortcutAction for TranscribeAction {
                                     post_process,
                                     processed.post_processed_text.clone(),
                                     processed.post_process_prompt.clone(),
-                                    dictation_usage(&tm, sample_count, true),
+                                    dictation_usage(&tm, sample_count, true, via_batch),
                                 ) {
                                     error!("Failed to save history entry: {}", err);
                                 }
@@ -1018,7 +1063,7 @@ impl ShortcutAction for TranscribeAction {
                                     // Billed = false: the transcription failed, so
                                     // the duration is still worth recording but a
                                     // cost would be invented.
-                                    dictation_usage(&tm, sample_count, false),
+                                    dictation_usage(&tm, sample_count, false, via_batch),
                                 ) {
                                     error!("Failed to save failed history entry: {}", save_err);
                                 }
