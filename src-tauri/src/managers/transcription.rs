@@ -1572,6 +1572,14 @@ impl TranscriptionManager {
         let mut tentative = String::new();
         let mut failed = false;
 
+        // Timeline of what the session produced. Without it a truncated
+        // dictation is indistinguishable from a short one: the transcript alone
+        // cannot say whether the service went silent, hung up, or kept sending
+        // hypotheses it never finalized.
+        let started = std::time::Instant::now();
+        let interim_count = std::cell::Cell::new(0usize);
+        let last_interim_at = std::cell::Cell::new(0.0f64);
+
         // Drain whatever the socket has produced, updating the overlay's
         // committed prefix (finalized chunks) and volatile suffix (the latest
         // partial hypothesis).
@@ -1581,8 +1589,18 @@ impl TranscriptionManager {
                           failed: &mut bool| {
             for event in events {
                 match event {
-                    LiveEvent::Interim(text) => *tentative = text,
+                    LiveEvent::Interim(text) => {
+                        interim_count.set(interim_count.get() + 1);
+                        last_interim_at.set(started.elapsed().as_secs_f64());
+                        *tentative = text;
+                    }
                     LiveEvent::Final(text) => {
+                        debug!(
+                            "Gemini Live: final chunk #{} at {:.1}s into the session ({} bytes)",
+                            finals.len() + 1,
+                            started.elapsed().as_secs_f64(),
+                            text.len()
+                        );
                         finals.push(text);
                         tentative.clear();
                     }
@@ -1590,7 +1608,16 @@ impl TranscriptionManager {
                         warn!("Gemini Live: session ended with an error: {}", e);
                         *failed = true;
                     }
-                    LiveEvent::Closed(Ok(())) => {}
+                    LiveEvent::Closed(Ok(())) => {
+                        // Reaching here at all means the close arrived while
+                        // audio was still being fed: this closure only runs on
+                        // the Feed arm.
+                        warn!(
+                            "Gemini Live: the session closed {:.1}s in, while still recording",
+                            started.elapsed().as_secs_f64()
+                        );
+                        *failed = true;
+                    }
                 }
             }
         };

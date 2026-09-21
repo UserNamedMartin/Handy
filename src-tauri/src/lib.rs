@@ -73,6 +73,38 @@ fn level_filter_from_u8(value: u8) -> log::LevelFilter {
     }
 }
 
+/// Debug-level chatter from dependencies, which a postmortem never wants and
+/// which is expensive in a way that matters. At `debug` the `enigo` keyboard
+/// shim logs a line per key event: that filled the 500 KB log in about four
+/// minutes, and `RotationStrategy::KeepOne` then deleted the only copy. A
+/// dictation that misbehaved was therefore unexplainable by the time anyone
+/// looked at it. Our own modules are never filtered here — only these crates,
+/// and only below Info.
+fn is_noisy_dependency(metadata: &log::Metadata) -> bool {
+    if metadata.level() <= log::Level::Info {
+        return false;
+    }
+    const NOISY: [&str; 10] = [
+        "enigo",
+        "rustls",
+        "tungstenite",
+        "tokio_tungstenite",
+        "tao",
+        "wry",
+        "hyper",
+        "hyper_util",
+        "reqwest",
+        "h2",
+    ];
+    let target = metadata.target();
+    NOISY.iter().any(|krate| {
+        target == *krate
+            || target
+                .strip_prefix(krate)
+                .is_some_and(|rest| rest.starts_with("::"))
+    })
+}
+
 fn build_console_filter() -> env_filter::Filter {
     let mut builder = EnvFilterBuilder::new();
 
@@ -880,7 +912,7 @@ pub fn run(cli_args: CliArgs) {
         .plugin(
             LogBuilder::new()
                 .level(log::LevelFilter::Trace) // Set to most verbose level globally
-                .max_file_size(500_000)
+                .max_file_size(5_000_000)
                 .rotation_strategy(RotationStrategy::KeepOne)
                 .clear_targets()
                 .targets([
@@ -911,6 +943,7 @@ pub fn run(cli_args: CliArgs) {
                     .filter(|metadata| {
                         let file_level = FILE_LOG_LEVEL.load(Ordering::Relaxed);
                         metadata.level() <= level_filter_from_u8(file_level)
+                            && !is_noisy_dependency(metadata)
                     }),
                     // Stream logs to the webview (via the `log://log` event) so the
                     // debug panel's live log viewer can show them in real time. Only

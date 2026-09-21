@@ -428,6 +428,18 @@ async fn session(
             inbound = reader.next() => {
                 match inbound {
                     Some(Ok(msg)) => {
+                        if let Message::Close(frame) = &msg {
+                            match frame {
+                                Some(f) => warn!(
+                                    "Gemini Live: server sent a close frame: code={} reason={:?} (end-of-audio already sent: {})",
+                                    f.code, f.reason, ended
+                                ),
+                                None => warn!(
+                                    "Gemini Live: server sent a close frame with no code (end-of-audio already sent: {})",
+                                    ended
+                                ),
+                            }
+                        }
                         if handle_server_message(&message_text(&msg), &event_tx, ended) {
                             let _ = event_tx.send(LiveEvent::Closed(Ok(())));
                             return;
@@ -440,7 +452,17 @@ async fn session(
                         return;
                     }
                     None => {
-                        let _ = event_tx.send(LiveEvent::Closed(Ok(())));
+                        // A close arriving before `activityEnd` is the service
+                        // hanging up mid-dictation, not a finished turn.
+                        // Reporting it as `Ok` is what let a truncated
+                        // transcript look like a complete one.
+                        if ended {
+                            let _ = event_tx.send(LiveEvent::Closed(Ok(())));
+                        } else {
+                            let _ = event_tx.send(LiveEvent::Closed(Err(anyhow!(
+                                "Gemini Live: the service closed the connection mid-dictation"
+                            ))));
+                        }
                         return;
                     }
                 }
@@ -472,6 +494,11 @@ fn handle_server_message(
         return false;
     };
     let Some(content) = value.get("serverContent") else {
+        // Everything the service says that is not transcript used to be dropped
+        // here without a trace — `goAway` included, which is precisely the frame
+        // that says why a session is about to end. A 451 s dictation shipped
+        // half of itself and the log had nothing to explain it.
+        debug!("Gemini Live: non-transcript frame: {}", truncate(text));
         return false;
     };
 
