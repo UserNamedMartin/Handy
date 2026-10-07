@@ -72,6 +72,38 @@ second tap does not, latch locks a live hold, cancel clears a pending window, an
 `next_deadline` picks the nearer timer. Upstream's coordinator tests still pass
 unchanged.
 
+### Automatic microphone: the mask first, never the system default
+
+`src-tauri/src/managers/audio.rs` (`auto_microphone`, `override_end_reason`,
+`on_input_devices_changed`) + `audio_toolkit/audio/device_watch.rs`.
+
+With no microphone picked ("Auto" in Settings → Sound), the app does **not**
+follow the macOS default input — that is whatever connected last, usually the
+WH-1000XM6 over Bluetooth. It takes `Mask Microphone` (the VEKTA stenomask's
+USB interface) when connected, else the built-in `MacBook … Microphone`, and
+the system default only when neither exists.
+
+A microphone picked by hand is a **temporary override**: it holds until that
+device disconnects or the mask is plugged in, then the setting goes back to
+Auto (`selected_microphone = None`). Picking a device while the mask is already
+connected holds until something changes — that is a deliberate choice against
+the mask. A restart is not a plug-in.
+
+Why this was needed: upstream's #1874 erases `selected_microphone` when the
+device is missing and falls back to the system default. So unplugging the mask
+once left Handy on the headphones forever, and plugging it back changed
+nothing — there was no device-change notification at all.
+
+How plugs are seen: a CoreAudio listener on `kAudioHardwarePropertyDevices`
+(`objc2-core-audio`, the version cpal already pulls in), debounced 400 ms
+because a USB headset arrives as several notifications. On each change the
+manager drops the device cache, ends an override that no longer applies,
+emits `input-devices-changed` (the settings store refreshes the dropdown), and
+moves an idle open stream to the new device. A live recording is never touched.
+The automatic choice is cached between recordings only while the listener is
+active, so a recording start still costs no enumeration; without the listener
+(non-macOS) Auto re-enumerates on every start.
+
 ### ElevenLabs Scribe v2 as a second cloud backend
 
 `src-tauri/src/cloud/elevenlabs.rs` — a second cloud engine alongside Gemini,

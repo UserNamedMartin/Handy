@@ -1,5 +1,6 @@
 // Re-export all audio components
 mod device;
+mod device_watch;
 mod gain;
 mod recorder;
 mod resampler;
@@ -9,6 +10,7 @@ mod utils;
 mod visualizer;
 
 pub use device::{list_input_devices, list_output_devices, CpalDeviceInfo};
+pub use device_watch::watch_device_changes;
 pub use gain::{whisper_autogain, whisper_autogain_with_meta};
 pub use recorder::CaptureDebug;
 pub use recorder::{

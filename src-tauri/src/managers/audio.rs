@@ -261,9 +261,65 @@ struct MuteState {
 /// regular selections are kept distinct so losing a clamshell-only device does
 /// not erase the user's normal microphone preference.
 enum DesiredMicrophone {
-    Default,
+    /// Nothing pinned: [`auto_microphone`] picks.
+    Auto,
     Selected(String),
     Clamshell(String),
+}
+
+/* ---------- automatic microphone choice (fork) -------------------------- */
+//
+// With nothing pinned, the app does not follow the macOS system default: that
+// is whatever was connected last — often Bluetooth headphones, whose mic is
+// the worst one in the room. It takes the dictation mask when it is plugged
+// in, otherwise the laptop's own microphone, and the system default only when
+// neither exists.
+//
+// A microphone picked by hand is a temporary override. It holds until that
+// device disconnects, or until the mask is plugged in — then the choice goes
+// back to automatic, so plugging in the mask is all it ever takes to dictate
+// through it.
+
+/// The METADOX VEKTA stenomask, as its USB audio interface names itself.
+pub const MASK_MICROPHONE: &str = "Mask Microphone";
+
+/// The laptop's built-in microphone ("MacBook Pro Microphone", "MacBook Air
+/// Microphone", ...).
+fn is_builtin_microphone(name: &str) -> bool {
+    name.starts_with("MacBook") && name.ends_with("Microphone")
+}
+
+/// The automatic choice among the connected input devices: the mask, else the
+/// built-in microphone, else `None` (the system default).
+fn auto_microphone<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    let mut builtin = None;
+    for name in names {
+        if name == MASK_MICROPHONE {
+            return Some(name);
+        }
+        if builtin.is_none() && is_builtin_microphone(name) {
+            builtin = Some(name);
+        }
+    }
+    builtin
+}
+
+/// Why a hand-picked microphone stops applying after the device list changed,
+/// or `None` while it still holds. `mask_was_present` is the mask's state
+/// before this change; `None` means it was never observed.
+fn override_end_reason(
+    pinned: &str,
+    connected: &[String],
+    mask_was_present: Option<bool>,
+) -> Option<&'static str> {
+    if !connected.iter().any(|name| name == pinned) {
+        return Some("it was disconnected");
+    }
+    let mask_now = connected.iter().any(|name| name == MASK_MICROPHONE);
+    if pinned != MASK_MICROPHONE && mask_now && mask_was_present == Some(false) {
+        return Some("the mask was plugged in");
+    }
+    None
 }
 
 /// Result of resolving the persisted preference to a live cpal device.
@@ -395,13 +451,20 @@ pub struct AudioRecordingManager {
     /// stopped or cancelled. This prevents a slow device from producing a late
     /// "ready" indication for a session the user already ended.
     capture_generation: Arc<AtomicU64>,
-    /// Resolution of a *named* microphone (selected or clamshell) to its cpal
-    /// device, cached so on-demand recording starts skip the full device
-    /// enumeration (~40-110ms). Keyed by the resolved name, so a settings
-    /// change misses naturally; cleared when an open fails (device unplugged)
-    /// so the retry re-enumerates. The system-default case is never cached —
-    /// the recorder resolves the current default itself, cheaply.
-    cached_device: Arc<Mutex<Option<(String, cpal::Device)>>>,
+    /// Resolution of the desired microphone to its cpal device, cached so
+    /// on-demand recording starts skip the full device enumeration
+    /// (~40-110ms). Keyed by the pinned name (`None` = the automatic choice),
+    /// so a settings change misses naturally; cleared when an open fails
+    /// (device unplugged) and on every device-list change, so the next start
+    /// re-enumerates. The automatic choice is cached only while
+    /// `device_watch_active` — without plug notifications nothing would ever
+    /// tell it the mask had arrived.
+    cached_device: Arc<Mutex<Option<(Option<String>, cpal::Device)>>>,
+    /// Whether CoreAudio device-change notifications are arriving.
+    device_watch_active: Arc<AtomicBool>,
+    /// The mask's presence as of the last device-list check (`None` before the
+    /// first), so a plug-in can be told apart from "was already there".
+    mask_present: Arc<Mutex<Option<bool>>>,
 }
 
 impl AudioRecordingManager {
@@ -433,6 +496,8 @@ impl AudioRecordingManager {
             recording_active: Arc::new(AtomicBool::new(false)),
             capture_generation: Arc::new(AtomicU64::new(0)),
             cached_device: Arc::new(Mutex::new(None)),
+            device_watch_active: Arc::new(AtomicBool::new(false)),
+            mask_present: Arc::new(Mutex::new(None)),
         };
 
         // Always-on?  Open immediately.
@@ -463,7 +528,7 @@ impl AudioRecordingManager {
         }
         match &settings.selected_microphone {
             Some(name) => DesiredMicrophone::Selected(name.clone()),
-            None => DesiredMicrophone::Default,
+            None => DesiredMicrophone::Auto,
         }
     }
 
@@ -473,27 +538,28 @@ impl AudioRecordingManager {
 
     fn resolve_microphone_device(&self, settings: &AppSettings) -> MicrophoneResolution {
         let desired = self.desired_microphone(settings);
-        let (device_name, selected_microphone) = match desired {
-            DesiredMicrophone::Default => {
-                debug!("device resolve: no mic configured -> system default");
-                return MicrophoneResolution {
-                    device: None,
-                    unavailable_selected_microphone: None,
-                };
+        let pinned = match &desired {
+            DesiredMicrophone::Auto => None,
+            DesiredMicrophone::Selected(name) | DesiredMicrophone::Clamshell(name) => {
+                Some(name.clone())
             }
-            DesiredMicrophone::Selected(name) => (name.clone(), Some(name)),
-            DesiredMicrophone::Clamshell(name) => (name, None),
         };
+        let cacheable = pinned.is_some() || self.device_watch_active.load(Ordering::SeqCst);
 
         // Cache hit: skip the full enumeration. A stale device (unplugged)
         // fails at open, where the caller invalidates and retries fresh.
-        if let Some((cached_name, device)) = self.cached_device.lock().unwrap().as_ref() {
-            if *cached_name == device_name {
-                debug!("device resolve: cache hit for '{}'", device_name);
-                return MicrophoneResolution {
-                    device: Some(device.clone()),
-                    unavailable_selected_microphone: None,
-                };
+        if cacheable {
+            if let Some((cached_key, device)) = self.cached_device.lock().unwrap().as_ref() {
+                if *cached_key == pinned {
+                    debug!(
+                        "device resolve: cache hit for '{}'",
+                        pinned.as_deref().unwrap_or("auto")
+                    );
+                    return MicrophoneResolution {
+                        device: Some(device.clone()),
+                        unavailable_selected_microphone: None,
+                    };
+                }
             }
         }
 
@@ -501,36 +567,125 @@ impl AudioRecordingManager {
         // itself succeeded. A backend enumeration error may be transient and
         // must not erase the user's persisted preference.
         let enumerate_started = Instant::now();
-        let (device, enumeration_succeeded) = match list_input_devices() {
-            Ok(devices) => (
-                devices
-                    .into_iter()
-                    .find(|d| d.name == device_name)
-                    .map(|d| d.device),
-                true,
-            ),
+        let devices = match list_input_devices() {
+            Ok(devices) => devices,
             Err(e) => {
                 debug!("Failed to list devices, using default: {}", e);
-                (None, false)
+                return MicrophoneResolution {
+                    device: None,
+                    unavailable_selected_microphone: None,
+                };
             }
         };
         debug!(
-            "device resolve: enumerate={:?} (found={})",
-            enumerate_started.elapsed(),
-            device.is_some()
+            "device resolve: enumerate={:?}",
+            enumerate_started.elapsed()
         );
-        if let Some(d) = &device {
-            *self.cached_device.lock().unwrap() = Some((device_name, d.clone()));
+
+        if let Some(name) = &pinned {
+            if let Some(found) = devices.iter().find(|d| &d.name == name) {
+                *self.cached_device.lock().unwrap() = Some((pinned.clone(), found.device.clone()));
+                return MicrophoneResolution {
+                    device: Some(found.device.clone()),
+                    unavailable_selected_microphone: None,
+                };
+            }
         }
 
-        let unavailable_selected_microphone = if enumeration_succeeded && device.is_none() {
-            selected_microphone
-        } else {
-            None
+        // Nothing pinned, or the pinned device is gone: the automatic choice.
+        let unavailable_selected_microphone = match desired {
+            DesiredMicrophone::Selected(name) => Some(name),
+            _ => None,
         };
+        let auto_name = auto_microphone(devices.iter().map(|d| d.name.as_str()));
+        debug!(
+            "device resolve: auto -> {}",
+            auto_name.unwrap_or("system default")
+        );
+        let device = auto_name
+            .and_then(|name| devices.iter().find(|d| d.name == name))
+            .map(|d| d.device.clone());
+        if let (Some(d), true, None) = (&device, cacheable, &pinned) {
+            *self.cached_device.lock().unwrap() = Some((None, d.clone()));
+        }
         MicrophoneResolution {
             device,
             unavailable_selected_microphone,
+        }
+    }
+
+    /// Start following plug/unplug. Call once, after the manager is in Tauri
+    /// state. Until this runs, the automatic choice is resolved fresh on every
+    /// recording start.
+    pub fn start_device_watch(&self) {
+        let app = self.app_handle.clone();
+        let active = crate::audio_toolkit::watch_device_changes(move || {
+            app.state::<Arc<AudioRecordingManager>>()
+                .on_input_devices_changed();
+        });
+        self.device_watch_active.store(active, Ordering::SeqCst);
+        info!(
+            "Microphone device watch {}",
+            if active { "active" } else { "unavailable" }
+        );
+
+        // Record where the mask stands now, so the first plug-in after launch
+        // counts as one.
+        let rm = self
+            .app_handle
+            .state::<Arc<AudioRecordingManager>>()
+            .inner()
+            .clone();
+        std::thread::spawn(move || rm.on_input_devices_changed());
+    }
+
+    /// The device list changed: end a hand-picked override that no longer
+    /// applies, forget cached devices, and move an idle open stream onto the
+    /// device the next recording would use.
+    fn on_input_devices_changed(&self) {
+        self.invalidate_device_cache();
+        let connected: Vec<String> = match list_input_devices() {
+            Ok(devices) => devices.into_iter().map(|d| d.name).collect(),
+            Err(e) => {
+                warn!("device watch: could not list input devices: {e}");
+                return;
+            }
+        };
+        let mask_now = connected.iter().any(|name| name == MASK_MICROPHONE);
+        let mask_before = self.mask_present.lock().unwrap().replace(mask_now);
+
+        let mut settings = get_settings(&self.app_handle);
+        let mut changed = false;
+        if let Some(pinned) = settings.selected_microphone.clone() {
+            if let Some(reason) = override_end_reason(&pinned, &connected, mask_before) {
+                info!("Microphone '{pinned}' no longer pinned ({reason}); back to automatic");
+                settings.selected_microphone = None;
+                write_settings(&self.app_handle, settings);
+                changed = true;
+            }
+        }
+
+        let _ = self.app_handle.emit("input-devices-changed", ());
+        if changed {
+            let _ = self.app_handle.emit(
+                "settings-changed",
+                serde_json::json!({
+                    "setting": "selected_microphone",
+                    "value": "Default"
+                }),
+            );
+        }
+
+        // An always-on (or lingering) stream would otherwise keep capturing
+        // from the old device until the next restart. Never touch a live
+        // recording — the next one picks up the new device.
+        let state = self.state.lock().unwrap();
+        if matches!(*state, RecordingState::Idle) && *self.is_open.lock().unwrap() {
+            self.close_generation.fetch_add(1, Ordering::SeqCst);
+            self.stop_microphone_stream();
+            if let Err(e) = self.start_microphone_stream() {
+                warn!("device watch: could not reopen the microphone stream: {e}");
+            }
         }
     }
 
@@ -1107,5 +1262,74 @@ impl AudioRecordingManager {
             }
             RecordingState::Idle => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod auto_microphone_tests {
+    use super::*;
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn mask_beats_everything() {
+        let connected = ["WH-1000XM6", "MacBook Pro Microphone", MASK_MICROPHONE];
+        assert_eq!(auto_microphone(connected), Some(MASK_MICROPHONE));
+    }
+
+    #[test]
+    fn builtin_without_the_mask() {
+        let connected = [
+            "WH-1000XM6",
+            "MacBook Pro Microphone",
+            "Microsoft Teams Audio",
+        ];
+        assert_eq!(auto_microphone(connected), Some("MacBook Pro Microphone"));
+        assert_eq!(
+            auto_microphone(["MacBook Air Microphone"]),
+            Some("MacBook Air Microphone")
+        );
+    }
+
+    #[test]
+    fn system_default_when_neither() {
+        assert_eq!(auto_microphone(["WH-1000XM6"]), None);
+        assert_eq!(auto_microphone(["MacBook Pro Speakers"]), None);
+    }
+
+    #[test]
+    fn override_ends_when_its_device_leaves() {
+        let connected = names(&["MacBook Pro Microphone"]);
+        assert!(override_end_reason("WH-1000XM6", &connected, Some(false)).is_some());
+    }
+
+    #[test]
+    fn override_ends_when_the_mask_arrives() {
+        let connected = names(&["WH-1000XM6", MASK_MICROPHONE]);
+        assert!(override_end_reason("WH-1000XM6", &connected, Some(false)).is_some());
+    }
+
+    #[test]
+    fn override_holds_while_the_mask_stays() {
+        // Picked by hand with the mask already connected: that is a choice
+        // against the mask, and it holds until something changes.
+        let connected = names(&["WH-1000XM6", MASK_MICROPHONE]);
+        assert_eq!(
+            override_end_reason("WH-1000XM6", &connected, Some(true)),
+            None
+        );
+        // Mask state not yet observed (app launch): not a plug-in either.
+        assert_eq!(override_end_reason("WH-1000XM6", &connected, None), None);
+    }
+
+    #[test]
+    fn pinning_the_mask_itself_is_not_ended_by_the_mask() {
+        let connected = names(&[MASK_MICROPHONE]);
+        assert_eq!(
+            override_end_reason(MASK_MICROPHONE, &connected, Some(false)),
+            None
+        );
     }
 }

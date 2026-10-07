@@ -36,9 +36,14 @@ export const MicrophoneSelector: React.FC<MicrophoneSelectorProps> = React.memo(
       await resetSetting("selected_microphone");
     };
 
+    // "Default" is not the macOS default here: with nothing picked, the
+    // backend chooses the mask, else the built-in microphone.
     const microphoneOptions = audioDevices.map((device) => ({
       value: device.name,
-      label: device.name,
+      label:
+        device.name === "Default"
+          ? t("settings.sound.microphone.auto")
+          : device.name,
     }));
 
     return (

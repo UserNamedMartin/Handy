@@ -211,6 +211,8 @@ fn initialize_core_logic(app_handle: &AppHandle) {
 
     // Add managers to Tauri's managed state
     app_handle.manage(recording_manager.clone());
+    // Needs the manager in Tauri state: the watcher reaches it from there.
+    recording_manager.start_device_watch();
     app_handle.manage(model_manager.clone());
     app_handle.manage(transcription_manager.clone());
     app_handle.manage(history_manager.clone());

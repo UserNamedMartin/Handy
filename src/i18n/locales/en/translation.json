@@ -262,7 +262,8 @@
       "title": "Sound",
       "microphone": {
         "title": "Microphone",
-        "description": "Select your preferred microphone device",
+        "description": "Auto uses the mask microphone when it is connected, otherwise the MacBook microphone. A microphone you pick holds until it disconnects or the mask is plugged in.",
+        "auto": "Auto (mask, else MacBook)",
         "placeholder": "Select microphone...",
         "loading": "Loading..."
       },

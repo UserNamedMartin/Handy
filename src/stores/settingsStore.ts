@@ -658,6 +658,10 @@ export const useSettingsStore = create<SettingsStore>()(
       listen("model-state-changed", () => {
         get().refreshSettings();
       });
+      // A microphone was plugged in or pulled out.
+      listen("input-devices-changed", () => {
+        get().refreshAudioDevices();
+      });
       listen<{ setting?: string }>("settings-changed", (event) => {
         get().refreshSettings();
         if (event.payload.setting === "selected_microphone") {
