@@ -569,7 +569,9 @@ and again by `update_transcription` so a successful retry replaces its
 dictation's text (keyed by file name, so a retry never adds a row). An empty
 text is a failed transcription, not a transcript, and is skipped until a retry
 succeeds. The migration seeds from what history held on 2026-10-07 (from
-2026-10-05 on, plus starred entries); everything older was already pruned.
+2026-10-05 on); everything older was already pruned. The three starred August
+entries it also seeded were deleted from `transcripts` by hand, like the
+ledger's — they are still in history while starred.
 Debug-capture bundles (`debug/`, 2026-08-28..30) and the eval corpus still hold
 older text but were deliberately not imported — statistics start in September.
 
