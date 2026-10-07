@@ -72,6 +72,32 @@ static MIGRATIONS: &[M] = &[
          SELECT timestamp, duration_ms, model_id, engine, cost_usd
          FROM transcription_history;",
     ),
+    // Every transcript, kept forever. `transcription_history` is the same kind
+    // of cache as above — trimmed to `history_limit` with its audio — so after
+    // ~200 dictations the text was gone too. This keeps only the text (a few
+    // MB a year at his rate, against 1-8 MB of WAV per dictation in history)
+    // and is deleted from nowhere: not by pruning, not by retention, not by
+    // deleting the entry from the history screen.
+    //
+    // Keyed by the recording's file name, which is unique per dictation, so a
+    // re-transcription replaces its dictation's text instead of adding a row.
+    M::up(
+        "CREATE TABLE IF NOT EXISTS transcripts (
+            file_name TEXT PRIMARY KEY,
+            timestamp INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            post_processed_text TEXT,
+            model_id TEXT
+        );",
+    ),
+    M::up("CREATE INDEX IF NOT EXISTS idx_transcripts_timestamp ON transcripts(timestamp);"),
+    // Seed from what history still holds; what pruning deleted is gone.
+    M::up(
+        "INSERT OR IGNORE INTO transcripts (file_name, timestamp, text, post_processed_text, model_id)
+         SELECT file_name, timestamp, transcription_text, post_processed_text, model_id
+         FROM transcription_history
+         WHERE transcription_text != '';",
+    ),
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize, Type)]
@@ -122,6 +148,26 @@ pub struct UsageBucket {
     /// How many dictations in this bucket actually carried a duration, so the UI
     /// can mark a partially-recorded period rather than show a false dip.
     pub measured: i64,
+}
+
+/// Split a transcript into lowercase words for counting.
+///
+/// A word is a run of letters and digits, keeping an apostrophe or hyphen
+/// inside it ("что-то", "don't", "о'кей") but not at its edges, and it must
+/// contain a letter — "2026" or "3.5" are not words. `ё` is folded to `е`,
+/// since the transcribers use both for the same word.
+fn words(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '\'' || c == '’'))
+        .map(|token| token.trim_matches(|c: char| c == '-' || c == '\'' || c == '’'))
+        .filter(|token| token.chars().any(char::is_alphabetic))
+        .map(|token| token.to_lowercase().replace('ё', "е").replace('’', "'"))
+}
+
+/// How often one word occurs across the transcripts.
+#[derive(Clone, Debug, Serialize, Deserialize, Type)]
+pub struct WordCount {
+    pub word: String,
+    pub count: i64,
 }
 
 /// Lifetime totals plus a per-model split.
@@ -409,6 +455,39 @@ impl HistoryManager {
         })
     }
 
+    /// The `limit` most frequent words in the transcripts since `since` (unix
+    /// seconds), or in all of them when `None`. Counts the raw transcript, not
+    /// the post-processed one — what was said, not what an LLM rewrote.
+    pub fn top_words(&self, since: Option<i64>, limit: usize) -> Result<Vec<WordCount>> {
+        let conn = self.get_connection()?;
+        Self::top_words_with_conn(&conn, since, limit)
+    }
+
+    fn top_words_with_conn(
+        conn: &Connection,
+        since: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<WordCount>> {
+        let mut stmt = conn.prepare("SELECT text FROM transcripts WHERE timestamp >= ?1")?;
+        let mut rows = stmt.query(params![since.unwrap_or(0)])?;
+        let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        while let Some(row) = rows.next()? {
+            let text: String = row.get(0)?;
+            for word in words(&text) {
+                *counts.entry(word).or_insert(0) += 1;
+            }
+        }
+        let mut ranked: Vec<WordCount> = counts
+            .into_iter()
+            .map(|(word, count)| WordCount { word, count })
+            .collect();
+        // Ties broken alphabetically so the list does not reshuffle between
+        // opens of the screen.
+        ranked.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.word.cmp(&b.word)));
+        ranked.truncate(limit);
+        Ok(ranked)
+    }
+
     pub fn recordings_dir(&self) -> &std::path::Path {
         &self.recordings_dir
     }
@@ -481,7 +560,43 @@ impl HistoryManager {
             ],
         )?;
 
+        Self::archive_transcript_with_conn(
+            conn,
+            file_name,
+            timestamp,
+            transcription_text,
+            post_processed_text,
+            usage.model_id.as_deref(),
+        )?;
+
         Ok(entry_id)
+    }
+
+    /// Keep a dictation's text in `transcripts`, which nothing prunes. An empty
+    /// text (a failed transcription) is not a transcript and is skipped; a
+    /// later retry that succeeds archives it then. Writing again for the same
+    /// recording replaces the text, keeping the model when the caller has none.
+    fn archive_transcript_with_conn(
+        conn: &Connection,
+        file_name: &str,
+        timestamp: i64,
+        text: &str,
+        post_processed_text: Option<&str>,
+        model_id: Option<&str>,
+    ) -> Result<()> {
+        if text.trim().is_empty() {
+            return Ok(());
+        }
+        conn.execute(
+            "INSERT INTO transcripts (file_name, timestamp, text, post_processed_text, model_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(file_name) DO UPDATE SET
+                text = excluded.text,
+                post_processed_text = excluded.post_processed_text,
+                model_id = COALESCE(excluded.model_id, transcripts.model_id)",
+            params![file_name, timestamp, text, post_processed_text, model_id],
+        )?;
+        Ok(())
     }
 
     /// Append one row to the usage ledger on its own, with no history entry
@@ -602,6 +717,15 @@ impl HistoryManager {
                 params![id],
                 Self::map_history_entry,
             )?;
+
+        Self::archive_transcript_with_conn(
+            &conn,
+            &entry.file_name,
+            entry.timestamp,
+            &entry.transcription_text,
+            entry.post_processed_text.as_deref(),
+            None,
+        )?;
 
         debug!("Updated transcription for history entry {}", id);
 
@@ -943,37 +1067,13 @@ mod tests {
     use super::*;
     use rusqlite::{params, Connection};
 
+    /// An in-memory store with the real schema, built by the same migrations
+    /// the app runs — a hand-written copy would drift from them.
     fn setup_conn() -> Connection {
-        let conn = Connection::open_in_memory().expect("open in-memory db");
-        conn.execute_batch(
-            "CREATE TABLE transcription_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                file_name TEXT NOT NULL,
-                timestamp INTEGER NOT NULL,
-                saved BOOLEAN NOT NULL DEFAULT 0,
-                title TEXT NOT NULL,
-                transcription_text TEXT NOT NULL,
-                post_processed_text TEXT,
-                post_process_prompt TEXT,
-                post_process_requested BOOLEAN NOT NULL DEFAULT 0,
-                duration_ms INTEGER,
-                model_id TEXT,
-                engine TEXT,
-                cost_usd REAL
-            );",
-        )
-        .expect("create transcription_history table");
-        conn.execute_batch(
-            "CREATE TABLE usage_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp INTEGER NOT NULL,
-                duration_ms INTEGER,
-                model_id TEXT,
-                engine TEXT,
-                cost_usd REAL
-            );",
-        )
-        .expect("create usage_events table");
+        let mut conn = Connection::open_in_memory().expect("open in-memory db");
+        Migrations::from_slice(MIGRATIONS)
+            .to_latest(&mut conn)
+            .expect("apply migrations");
         conn
     }
 
@@ -1211,5 +1311,80 @@ mod tests {
 
         assert_eq!(entry.timestamp, 100);
         assert_eq!(entry.transcription_text, "completed");
+    }
+
+    #[test]
+    fn words_are_case_insensitive_and_keep_inner_hyphens() {
+        let found: Vec<String> =
+            words("Окей, ОКЕЙ — что-то ещё! Don't 2026 3.5 'Slack' ёлка").collect();
+        assert_eq!(
+            found,
+            ["окей", "окей", "что-то", "еще", "don't", "slack", "елка"]
+        );
+    }
+
+    fn dictate(conn: &Connection, file_name: &str, timestamp: i64, text: &str) -> i64 {
+        HistoryManager::insert_dictation_with_conn(
+            conn,
+            file_name,
+            timestamp,
+            "title",
+            text,
+            false,
+            None,
+            None,
+            &DictationUsage {
+                duration_ms: Some(1_000),
+                model_id: Some("gemini-3.5-transcribe-live".into()),
+                engine: Some("cloud".into()),
+                cost_usd: Some(0.0),
+            },
+        )
+        .expect("insert dictation")
+    }
+
+    #[test]
+    fn transcripts_outlive_history_pruning() {
+        let conn = setup_conn();
+        dictate(&conn, "a.wav", 100, "раз два");
+        dictate(&conn, "b.wav", 200, "");
+        conn.execute("DELETE FROM transcription_history", [])
+            .expect("prune history");
+
+        let kept: i64 = conn
+            .query_row("SELECT COUNT(*) FROM transcripts", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(kept, 1, "the text survives; the failed dictation is not a transcript");
+    }
+
+    #[test]
+    fn a_retry_replaces_its_dictations_transcript() {
+        let conn = setup_conn();
+        dictate(&conn, "a.wav", 100, "first try");
+        HistoryManager::archive_transcript_with_conn(&conn, "a.wav", 100, "second try", None, None)
+            .expect("archive retry");
+
+        let (text, model): (String, Option<String>) = conn
+            .query_row("SELECT text, model_id FROM transcripts", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .expect("one row");
+        assert_eq!(text, "second try");
+        assert_eq!(model.as_deref(), Some("gemini-3.5-transcribe-live"));
+    }
+
+    #[test]
+    fn top_words_rank_by_count_within_the_period() {
+        let conn = setup_conn();
+        dictate(&conn, "old.wav", 100, "старое старое старое старое");
+        dictate(&conn, "a.wav", 1_000, "Да, да, нет. Да!");
+        dictate(&conn, "b.wav", 2_000, "нет ну");
+
+        let top = HistoryManager::top_words_with_conn(&conn, Some(1_000), 2).expect("top words");
+        let pairs: Vec<(&str, i64)> = top.iter().map(|w| (w.word.as_str(), w.count)).collect();
+        assert_eq!(pairs, [("да", 3), ("нет", 2)]);
+
+        let all = HistoryManager::top_words_with_conn(&conn, None, 1).expect("all time");
+        assert_eq!(all[0].word, "старое");
     }
 }

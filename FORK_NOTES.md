@@ -556,7 +556,33 @@ chart, a per-model split and a monthly spend retrospective. The overview has an
 All time / This month toggle (`get_usage_summary(since)`, the month starting at
 local midnight on the 1st); the per-model table stays lifetime. The ledger
 starts in September 2026: the three August rows (the starred survivors of the
-seed) were deleted by hand on 2026-10-07 at Martin's request.
+seed) were deleted by hand on 2026-10-07 at Martin's request (backup in
+`backups/history-2026-10-07-before-aug-cleanup.db` next to `history.db`).
+
+**Every transcript is kept: the `transcripts` table.** Same reasoning as the
+ledger — `transcription_history` is a cache of ~200 entries, and the text went
+with the audio. `transcripts` (file_name PK / timestamp / text /
+post_processed_text / model_id) keeps only the text and is deleted from
+nowhere: not by `history_limit`, not by retention, not by the history screen's
+delete button. Written in `insert_dictation_with_conn` beside the ledger row,
+and again by `update_transcription` so a successful retry replaces its
+dictation's text (keyed by file name, so a retry never adds a row). An empty
+text is a failed transcription, not a transcript, and is skipped until a retry
+succeeds. The migration seeds from what history held on 2026-10-07 (from
+2026-10-05 on, plus starred entries); everything older was already pruned.
+Debug-capture bundles (`debug/`, 2026-08-28..30) and the eval corpus still hold
+older text but were deliberately not imported — statistics start in September.
+
+**Most used words** (`get_top_words(since, limit)`, `HistoryManager::top_words`)
+counts the raw transcripts in the overview's period — the toggle applies to it
+too. `words()` lowercases, folds `ё` to `е`, keeps inner hyphens and
+apostrophes (`что-то`, `don't`), and drops tokens with no letter. No stop-word
+list: the counts are literal, so function words lead. It reads every transcript
+in the period on each open (in `spawn_blocking`); at ~5 MB of text a year that
+is fine for years — add a cached word table if the screen ever gets slow.
+
+The history tests now build their schema by running `MIGRATIONS`
+(`setup_conn`), not a hand-written copy that drifted from them.
 
 **Costs are estimates.** No provider exposes a spend API — Google's billing lives
 in Cloud Console — so `cloud::estimate_cost_usd` multiplies billed duration by the
@@ -734,6 +760,15 @@ Written down because each one has already cost time to rediscover.
   better fix is Jot's `ValidationGate` shape — take both the raw and the cleaned
   text and fall back to raw when they diverge — rather than giving up cleanup
   entirely.
+- **Batch `gemini-3.5-transcribe` returned 400 "Thinking is not enabled for
+  this model" on every request from 2026-10-07** (last success 2026-10-06
+  18:46). Google-side: the same request fails with any parameters on both the
+  Interactions API and `generateContent`, and other clients reported it the
+  same day ([forum](https://discuss.ai.google.dev/t/gemini-3-5-transcribe-returns-400-thinking-is-not-enabled-for-this-model-without-thinking-settings/187280),
+  [js-genai#2011](https://github.com/googleapis/js-genai/issues/2011)). It
+  breaks dictations past the Live ceiling (they go to batch) and the history
+  retry button; Live is unaffected. Martin chose to wait it out. If it
+  persists, fall back to ElevenLabs Scribe v2 when batch Gemini fails.
 - **The tree is not `cargo fmt` clean**, and CI does not check it. Format the
   lines you touch, not the files: several of these files are ones upstream also
   owns, and a whole-file reformat is exactly the kind of thing that makes the

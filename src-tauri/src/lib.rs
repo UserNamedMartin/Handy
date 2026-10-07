@@ -902,6 +902,7 @@ pub fn run(cli_args: CliArgs) {
             commands::history::get_usage_daily,
             commands::history::get_usage_monthly,
             commands::history::get_usage_summary,
+            commands::history::get_top_words,
             helpers::clamshell::is_laptop,
         ])
         .events(collect_events![

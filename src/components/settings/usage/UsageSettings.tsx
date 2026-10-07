@@ -1,6 +1,11 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { commands, type UsageBucket, type UsageSummary } from "@/bindings";
+import {
+  commands,
+  type UsageBucket,
+  type UsageSummary,
+  type WordCount,
+} from "@/bindings";
 import { SettingsGroup } from "../../ui/SettingsGroup";
 
 /** Day windows offered by the activity chart. */
@@ -137,6 +142,7 @@ export const UsageSettings: React.FC = () => {
   const [summary, setSummary] = useState<UsageSummary | null>(null);
   const [period, setPeriod] = useState<Period>("all");
   const [overview, setOverview] = useState<UsageSummary | null>(null);
+  const [topWords, setTopWords] = useState<WordCount[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -161,12 +167,15 @@ export const UsageSettings: React.FC = () => {
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      const s = await commands.getUsageSummary(
-        period === "month" ? startOfMonth() : null,
-      );
+      const since = period === "month" ? startOfMonth() : null;
+      const [s, w] = await Promise.all([
+        commands.getUsageSummary(since),
+        commands.getTopWords(since, 10),
+      ]);
       if (cancelled) return;
       if (s.status === "ok") setOverview(s.data);
       else setError(s.error);
+      if (w.status === "ok") setTopWords(w.data);
     })();
     return () => {
       cancelled = true;
@@ -252,6 +261,32 @@ export const UsageSettings: React.FC = () => {
         {unmeasured > 0 && (
           <div className="px-3 pb-3 text-[0.7rem] text-text/40">
             {t("settings.usage.unmeasured", { count: unmeasured })}
+          </div>
+        )}
+        {topWords.length > 0 && (
+          <div className="px-3 py-3">
+            <div className="mb-2 text-xs text-text/50">
+              {t("settings.usage.topWords")}
+            </div>
+            {/* Column-major, so rank reads down the left column first. */}
+            <ol className="grid grid-flow-col grid-rows-5 grid-cols-2 gap-x-6 gap-y-1 text-sm">
+              {topWords.map((entry, index) => (
+                <li
+                  key={entry.word}
+                  className="flex items-baseline gap-2 min-w-0"
+                >
+                  <span className="w-4 shrink-0 text-right text-xs text-text/40 tabular-nums">
+                    {index + 1}
+                  </span>
+                  <span className="truncate text-text" title={entry.word}>
+                    {entry.word}
+                  </span>
+                  <span className="ml-auto tabular-nums text-text/60">
+                    {entry.count.toLocaleString()}
+                  </span>
+                </li>
+              ))}
+            </ol>
           </div>
         )}
       </SettingsGroup>

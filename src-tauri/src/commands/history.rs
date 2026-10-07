@@ -1,6 +1,6 @@
 use crate::actions::process_transcription_output;
 use crate::managers::{
-    history::{HistoryManager, PaginatedHistory, UsageBucket, UsageSummary},
+    history::{HistoryManager, PaginatedHistory, UsageBucket, UsageSummary, WordCount},
     transcription::TranscriptionManager,
 };
 use std::sync::Arc;
@@ -216,5 +216,22 @@ pub async fn get_usage_summary(
 ) -> Result<UsageSummary, String> {
     history_manager
         .usage_summary(since)
+        .map_err(|e| e.to_string())
+}
+
+/// The `limit` most frequent words in the transcripts since `since` (unix
+/// seconds), or in all of them when `None`.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_top_words(
+    history_manager: State<'_, Arc<HistoryManager>>,
+    since: Option<i64>,
+    limit: Option<u32>,
+) -> Result<Vec<WordCount>, String> {
+    // Reads every transcript in the period — keep it off the async runtime.
+    let manager = history_manager.inner().clone();
+    tokio::task::spawn_blocking(move || manager.top_words(since, limit.unwrap_or(10) as usize))
+        .await
+        .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())
 }

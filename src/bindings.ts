@@ -981,6 +981,18 @@ async getUsageSummary(since: number | null) : Promise<Result<UsageSummary, strin
 }
 },
 /**
+ * The `limit` most frequent words in the transcripts since `since` (unix
+ * seconds), or in all of them when `None`.
+ */
+async getTopWords(since: number | null, limit: number | null) : Promise<Result<WordCount[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_top_words", { since, limit }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Checks if the Mac is a laptop by detecting battery presence
  * 
  * This uses pmset to check for battery information.
@@ -1385,6 +1397,10 @@ export type UsageByModel = { model_id: string; engine: string; dictations: numbe
 /**
  * Lifetime totals plus a per-model split.
  */
+/**
+ * How often one word occurs across the transcripts.
+ */
+export type WordCount = { word: string; count: number }
 export type UsageSummary = { dictations: number; seconds: number; cost_usd: number; measured: number; per_model: UsageByModel[] }
 export type VadBackend = "silero" | "earshot"
 export type WindowsMicrophonePermissionStatus = { supported: boolean; overall_access: PermissionAccess; device_access: PermissionAccess; app_access: PermissionAccess; desktop_app_access: PermissionAccess }
