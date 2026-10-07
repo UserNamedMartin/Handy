@@ -5,6 +5,9 @@ Personal fork of [cjpais/Handy](https://github.com/cjpais/Handy) with custom fea
 building, installing, and safely extending this fork. General architecture lives in
 [AGENTS.md](AGENTS.md); this file is the fork-specific delta + local ops.
 
+> **Never build or install without Martin's explicit go-ahead** — see
+> [CLAUDE.md](CLAUDE.md). The Build and Install sections below are for when he has said so.
+
 Remotes: `origin` = your fork (`UserNamedMartin/Handy`), `upstream` = `cjpais/Handy`.
 Bundle id: `com.pais.handy` (same as the official app → shares settings/models in
 `~/Library/Application Support/com.pais.handy`).
@@ -578,8 +581,10 @@ older text but were deliberately not imported — statistics start in September.
 **Most used words** (`get_top_words(since, limit)`, `HistoryManager::top_words`)
 counts the raw transcripts in the overview's period — the toggle applies to it
 too. `words()` lowercases, folds `ё` to `е`, keeps inner hyphens and
-apostrophes (`что-то`, `don't`), and drops tokens with no letter. No stop-word
-list: the counts are literal, so function words lead. It reads every transcript
+apostrophes (`что-то`, `don't`), drops tokens with no letter, and drops words
+under `MIN_WORD_CHARS` (3) — Martin's call, since one- and two-letter words
+("я", "и", "в", "не") filled the list. No stop-word list beyond that. Drawn as
+ranked bars scaled to the top word, the top three at full strength. It reads every transcript
 in the period on each open (in `spawn_blocking`); at ~5 MB of text a year that
 is fine for years — add a cached word table if the screen ever gets slow.
 
