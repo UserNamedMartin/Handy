@@ -150,16 +150,23 @@ pub struct UsageBucket {
     pub measured: i64,
 }
 
+/// The shortest word the top-words list counts. One- and two-letter words
+/// ("я", "и", "в", "не", "ну") are almost all function words and would fill
+/// the list on their own.
+const MIN_WORD_CHARS: usize = 3;
+
 /// Split a transcript into lowercase words for counting.
 ///
 /// A word is a run of letters and digits, keeping an apostrophe or hyphen
 /// inside it ("что-то", "don't", "о'кей") but not at its edges, and it must
 /// contain a letter — "2026" or "3.5" are not words. `ё` is folded to `е`,
-/// since the transcribers use both for the same word.
+/// since the transcribers use both for the same word. Words shorter than
+/// [`MIN_WORD_CHARS`] are dropped.
 fn words(text: &str) -> impl Iterator<Item = String> + '_ {
     text.split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '\'' || c == '’'))
         .map(|token| token.trim_matches(|c: char| c == '-' || c == '\'' || c == '’'))
         .filter(|token| token.chars().any(char::is_alphabetic))
+        .filter(|token| token.chars().count() >= MIN_WORD_CHARS)
         .map(|token| token.to_lowercase().replace('ё', "е").replace('’', "'"))
 }
 
@@ -1316,10 +1323,11 @@ mod tests {
     #[test]
     fn words_are_case_insensitive_and_keep_inner_hyphens() {
         let found: Vec<String> =
-            words("Окей, ОКЕЙ — что-то ещё! Don't 2026 3.5 'Slack' ёлка").collect();
+            words("Окей, ОКЕЙ — что-то ещё! Don't 2026 3.5 'Slack' ёлка я ну").collect();
         assert_eq!(
             found,
-            ["окей", "окей", "что-то", "еще", "don't", "slack", "елка"]
+            ["окей", "окей", "что-то", "еще", "don't", "slack", "елка"],
+            "one- and two-letter words are dropped"
         );
     }
 
@@ -1377,12 +1385,12 @@ mod tests {
     fn top_words_rank_by_count_within_the_period() {
         let conn = setup_conn();
         dictate(&conn, "old.wav", 100, "старое старое старое старое");
-        dictate(&conn, "a.wav", 1_000, "Да, да, нет. Да!");
+        dictate(&conn, "a.wav", 1_000, "Вот, вот, нет. Вот!");
         dictate(&conn, "b.wav", 2_000, "нет ну");
 
         let top = HistoryManager::top_words_with_conn(&conn, Some(1_000), 2).expect("top words");
         let pairs: Vec<(&str, i64)> = top.iter().map(|w| (w.word.as_str(), w.count)).collect();
-        assert_eq!(pairs, [("да", 3), ("нет", 2)]);
+        assert_eq!(pairs, [("вот", 3), ("нет", 2)]);
 
         let all = HistoryManager::top_words_with_conn(&conn, None, 1).expect("all time");
         assert_eq!(all[0].word, "старое");

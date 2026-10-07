@@ -268,24 +268,42 @@ export const UsageSettings: React.FC = () => {
             <div className="mb-2 text-xs text-text/50">
               {t("settings.usage.topWords")}
             </div>
-            {/* Column-major, so rank reads down the left column first. */}
-            <ol className="grid grid-flow-col grid-rows-5 grid-cols-2 gap-x-6 gap-y-1 text-sm">
-              {topWords.map((entry, index) => (
-                <li
-                  key={entry.word}
-                  className="flex items-baseline gap-2 min-w-0"
-                >
-                  <span className="w-4 shrink-0 text-right text-xs text-text/40 tabular-nums">
-                    {index + 1}
-                  </span>
-                  <span className="truncate text-text" title={entry.word}>
-                    {entry.word}
-                  </span>
-                  <span className="ml-auto tabular-nums text-text/60">
-                    {entry.count.toLocaleString()}
-                  </span>
-                </li>
-              ))}
+            {/* Bars scale to the top word, so the list reads as a ranking at a
+                glance; the top three are drawn at full strength. */}
+            <ol className="flex flex-col gap-1.5">
+              {topWords.map((entry, index) => {
+                const share = entry.count / topWords[0].count;
+                const podium = index < 3;
+                return (
+                  <li
+                    key={entry.word}
+                    className="grid grid-cols-[1.25rem_minmax(0,1fr)_3.5rem] items-center gap-2.5"
+                  >
+                    <span className="text-right text-xs text-text/40 tabular-nums">
+                      {index + 1}
+                    </span>
+                    <div className="relative h-7 rounded-md bg-mid-gray/10 overflow-hidden">
+                      <div
+                        className={`absolute inset-y-0 left-0 rounded-md ${
+                          podium ? "bg-logo-primary" : "bg-logo-primary/45"
+                        }`}
+                        style={{ width: `${Math.round(share * 100)}%` }}
+                      />
+                      <span
+                        className={`relative block truncate px-2.5 leading-7 text-sm text-text ${
+                          podium ? "font-medium" : ""
+                        }`}
+                        title={entry.word}
+                      >
+                        {entry.word}
+                      </span>
+                    </div>
+                    <span className="text-right text-sm tabular-nums text-text/60">
+                      {entry.count.toLocaleString()}
+                    </span>
+                  </li>
+                );
+              })}
             </ol>
           </div>
         )}
