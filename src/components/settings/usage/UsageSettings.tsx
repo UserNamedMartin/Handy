@@ -52,6 +52,47 @@ const modelLabel = (id: string): string => id.split("/").pop() || id;
 const formatCost = (usd: number): string =>
   usd === 0 ? "$0" : usd < 0.01 ? "<$0.01" : `$${usd.toFixed(2)}`;
 
+/**
+ * One choice out of a few, as a pill track with the chosen option filled.
+ * Shared by every toggle on this screen so they read as one control.
+ */
+function Segmented<T extends string | number>({
+  options,
+  value,
+  onChange,
+  label,
+}: {
+  options: readonly T[];
+  value: T;
+  onChange: (option: T) => void;
+  label: (option: T) => string;
+}) {
+  return (
+    <div className="inline-flex shrink-0 items-center gap-0.5 rounded-md bg-mid-gray/15 p-0.5">
+      {options.map((option) => {
+        const selected = option === value;
+        return (
+          <button
+            key={String(option)}
+            type="button"
+            aria-pressed={selected}
+            onClick={() => onChange(option)}
+            className={`h-6 min-w-[2.75rem] rounded px-2 text-xs leading-none transition-colors cursor-pointer ${
+              selected
+                ? // The brand pink is light in both themes; dark text keeps the
+                  // chosen label readable on it.
+                  "bg-logo-primary font-medium text-neutral-900"
+                : "text-text/55 hover:bg-mid-gray/20 hover:text-text"
+            }`}
+          >
+            {label(option)}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 const Stat: React.FC<{ label: string; value: string; hint?: string }> = ({
   label,
   value,
@@ -238,25 +279,18 @@ export const UsageSettings: React.FC = () => {
       <SettingsGroup
         title={t("settings.usage.overview")}
         action={
-          <div className="flex gap-1">
-            {(["all", "month"] as const).map((option) => (
-              <button
-                key={option}
-                onClick={() => setPeriod(option)}
-                className={`px-2 py-0.5 rounded text-xs transition-colors cursor-pointer ${
-                  period === option
-                    ? "bg-logo-primary/20 text-logo-primary"
-                    : "text-text/50 hover:text-text"
-                }`}
-              >
-                {t(
-                  option === "all"
-                    ? "settings.usage.allTime"
-                    : "settings.usage.thisMonth",
-                )}
-              </button>
-            ))}
-          </div>
+          <Segmented
+            options={["all", "month"] as const}
+            value={period}
+            onChange={setPeriod}
+            label={(option) =>
+              t(
+                option === "all"
+                  ? "settings.usage.allTime"
+                  : "settings.usage.thisMonth",
+              )
+            }
+          />
         }
       >
         <div className="flex flex-wrap gap-2 px-3 py-3">
@@ -282,30 +316,30 @@ export const UsageSettings: React.FC = () => {
             {t("settings.usage.unmeasured", { count: unmeasured })}
           </div>
         )}
-        {topWords.length > 0 && (
-          <div className="px-3 py-3">
-            <div className="mb-2 flex items-center justify-between">
-              <div className="text-xs text-text/50">
-                {t("settings.usage.topWords")}
-              </div>
-              <div className="flex gap-1">
-                {MIN_WORD_LENGTHS.map((option) => (
-                  <button
-                    key={option}
-                    onClick={() => setMinWordLength(option)}
-                    className={`px-2 py-0.5 rounded text-xs transition-colors cursor-pointer ${
-                      minWordLength === option
-                        ? "bg-logo-primary/20 text-logo-primary"
-                        : "text-text/50 hover:text-text"
-                    }`}
-                  >
-                    {t("settings.usage.minLetters", { count: option })}
-                  </button>
-                ))}
-              </div>
+        {/* Rendered even when empty, so the length toggle never disappears
+            out from under the user (5+ in a quiet month can come back empty). */}
+        <div className="px-3 py-3">
+          <div className="mb-3 flex items-center justify-between gap-3">
+            <div className="text-xs text-text/50">
+              {t("settings.usage.topWords")}
             </div>
-            {/* Bars scale to the top word, so the list reads as a ranking at a
-                glance; the top three are drawn at full strength. */}
+            <Segmented
+              options={MIN_WORD_LENGTHS}
+              value={minWordLength}
+              onChange={setMinWordLength}
+              label={(option) =>
+                t("settings.usage.minLetters", { count: option })
+              }
+            />
+          </div>
+          {topWords.length === 0 ? (
+            <div className="py-2 text-sm text-text/50">
+              {t("settings.usage.empty")}
+            </div>
+          ) : (
+            /* Bars scale to the top word, so the list reads as a ranking at a
+               glance; the top three are drawn stronger. Translucent so the
+               word on top stays readable in both themes. */
             <ol className="flex flex-col gap-1.5">
               {topWords.map((entry, index) => {
                 const share = entry.count / topWords[0].count;
@@ -315,18 +349,18 @@ export const UsageSettings: React.FC = () => {
                     key={entry.word}
                     className="grid grid-cols-[1.25rem_minmax(0,1fr)_3.5rem] items-center gap-2.5"
                   >
-                    <span className="text-right text-xs text-text/40 tabular-nums">
+                    <span className="text-center text-xs text-text/40 tabular-nums">
                       {index + 1}
                     </span>
-                    <div className="relative h-7 rounded-md bg-mid-gray/10 overflow-hidden">
+                    <div className="relative flex h-7 items-center overflow-hidden rounded-md bg-mid-gray/10">
                       <div
                         className={`absolute inset-y-0 left-0 rounded-md ${
-                          podium ? "bg-logo-primary" : "bg-logo-primary/45"
+                          podium ? "bg-logo-primary/60" : "bg-logo-primary/30"
                         }`}
                         style={{ width: `${Math.round(share * 100)}%` }}
                       />
                       <span
-                        className={`relative block truncate px-2.5 leading-7 text-sm text-text ${
+                        className={`relative truncate px-2.5 text-sm text-text ${
                           podium ? "font-medium" : ""
                         }`}
                         title={entry.word}
@@ -341,8 +375,8 @@ export const UsageSettings: React.FC = () => {
                 );
               })}
             </ol>
-          </div>
-        )}
+          )}
+        </div>
       </SettingsGroup>
 
       <SettingsGroup title={t("settings.usage.activity")}>
@@ -353,21 +387,12 @@ export const UsageSettings: React.FC = () => {
               {t("settings.usage.dictations")}
               {windowTotals.cost > 0 && ` · ${formatCost(windowTotals.cost)}`}
             </div>
-            <div className="flex gap-1">
-              {RANGES.map((option) => (
-                <button
-                  key={option}
-                  onClick={() => setRange(option)}
-                  className={`px-2 py-0.5 rounded text-xs transition-colors cursor-pointer ${
-                    range === option
-                      ? "bg-logo-primary/20 text-logo-primary"
-                      : "text-text/50 hover:text-text"
-                  }`}
-                >
-                  {t("settings.usage.days", { count: option })}
-                </button>
-              ))}
-            </div>
+            <Segmented
+              options={RANGES}
+              value={range}
+              onChange={setRange}
+              label={(option) => t("settings.usage.days", { count: option })}
+            />
           </div>
           <DailyChart buckets={windowed} />
         </div>
