@@ -15,6 +15,11 @@ type Range = (typeof RANGES)[number];
 /** What the overview totals cover. */
 type Period = "all" | "month";
 
+/** Shortest word the top-words list counts. Shorter words are mostly "и",
+ * "в", "что", "вот" — 4 is the default that lets real words through. */
+const MIN_WORD_LENGTHS = [3, 4, 5] as const;
+type MinWordLength = (typeof MIN_WORD_LENGTHS)[number];
+
 /** Unix seconds at local midnight on the 1st of the current month. */
 const startOfMonth = (): number => {
   const now = new Date();
@@ -143,6 +148,7 @@ export const UsageSettings: React.FC = () => {
   const [period, setPeriod] = useState<Period>("all");
   const [overview, setOverview] = useState<UsageSummary | null>(null);
   const [topWords, setTopWords] = useState<WordCount[]>([]);
+  const [minWordLength, setMinWordLength] = useState<MinWordLength>(4);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -167,20 +173,33 @@ export const UsageSettings: React.FC = () => {
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      const since = period === "month" ? startOfMonth() : null;
-      const [s, w] = await Promise.all([
-        commands.getUsageSummary(since),
-        commands.getTopWords(since, 10),
-      ]);
+      const s = await commands.getUsageSummary(
+        period === "month" ? startOfMonth() : null,
+      );
       if (cancelled) return;
       if (s.status === "ok") setOverview(s.data);
       else setError(s.error);
-      if (w.status === "ok") setTopWords(w.data);
     })();
     return () => {
       cancelled = true;
     };
   }, [period]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const w = await commands.getTopWords(
+        period === "month" ? startOfMonth() : null,
+        10,
+        minWordLength,
+      );
+      if (cancelled) return;
+      if (w.status === "ok") setTopWords(w.data);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [period, minWordLength]);
 
   const windowed = useMemo(() => fillDays(daily, range), [daily, range]);
 
@@ -265,8 +284,25 @@ export const UsageSettings: React.FC = () => {
         )}
         {topWords.length > 0 && (
           <div className="px-3 py-3">
-            <div className="mb-2 text-xs text-text/50">
-              {t("settings.usage.topWords")}
+            <div className="mb-2 flex items-center justify-between">
+              <div className="text-xs text-text/50">
+                {t("settings.usage.topWords")}
+              </div>
+              <div className="flex gap-1">
+                {MIN_WORD_LENGTHS.map((option) => (
+                  <button
+                    key={option}
+                    onClick={() => setMinWordLength(option)}
+                    className={`px-2 py-0.5 rounded text-xs transition-colors cursor-pointer ${
+                      minWordLength === option
+                        ? "bg-logo-primary/20 text-logo-primary"
+                        : "text-text/50 hover:text-text"
+                    }`}
+                  >
+                    {t("settings.usage.minLetters", { count: option })}
+                  </button>
+                ))}
+              </div>
             </div>
             {/* Bars scale to the top word, so the list reads as a ranking at a
                 glance; the top three are drawn at full strength. */}

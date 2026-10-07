@@ -150,23 +150,18 @@ pub struct UsageBucket {
     pub measured: i64,
 }
 
-/// The shortest word the top-words list counts. One- and two-letter words
-/// ("я", "и", "в", "не", "ну") are almost all function words and would fill
-/// the list on their own.
-const MIN_WORD_CHARS: usize = 3;
-
 /// Split a transcript into lowercase words for counting.
 ///
 /// A word is a run of letters and digits, keeping an apostrophe or hyphen
 /// inside it ("что-то", "don't", "о'кей") but not at its edges, and it must
 /// contain a letter — "2026" or "3.5" are not words. `ё` is folded to `е`,
 /// since the transcribers use both for the same word. Words shorter than
-/// [`MIN_WORD_CHARS`] are dropped.
-fn words(text: &str) -> impl Iterator<Item = String> + '_ {
+/// `min_chars` are dropped.
+fn words(text: &str, min_chars: usize) -> impl Iterator<Item = String> + '_ {
     text.split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '\'' || c == '’'))
         .map(|token| token.trim_matches(|c: char| c == '-' || c == '\'' || c == '’'))
         .filter(|token| token.chars().any(char::is_alphabetic))
-        .filter(|token| token.chars().count() >= MIN_WORD_CHARS)
+        .filter(move |token| token.chars().count() >= min_chars)
         .map(|token| token.to_lowercase().replace('ё', "е").replace('’', "'"))
 }
 
@@ -462,25 +457,32 @@ impl HistoryManager {
         })
     }
 
-    /// The `limit` most frequent words in the transcripts since `since` (unix
-    /// seconds), or in all of them when `None`. Counts the raw transcript, not
-    /// the post-processed one — what was said, not what an LLM rewrote.
-    pub fn top_words(&self, since: Option<i64>, limit: usize) -> Result<Vec<WordCount>> {
+    /// The `limit` most frequent words of at least `min_chars` letters in the
+    /// transcripts since `since` (unix seconds), or in all of them when `None`.
+    /// Counts the raw transcript, not the post-processed one — what was said,
+    /// not what an LLM rewrote.
+    pub fn top_words(
+        &self,
+        since: Option<i64>,
+        limit: usize,
+        min_chars: usize,
+    ) -> Result<Vec<WordCount>> {
         let conn = self.get_connection()?;
-        Self::top_words_with_conn(&conn, since, limit)
+        Self::top_words_with_conn(&conn, since, limit, min_chars)
     }
 
     fn top_words_with_conn(
         conn: &Connection,
         since: Option<i64>,
         limit: usize,
+        min_chars: usize,
     ) -> Result<Vec<WordCount>> {
         let mut stmt = conn.prepare("SELECT text FROM transcripts WHERE timestamp >= ?1")?;
         let mut rows = stmt.query(params![since.unwrap_or(0)])?;
         let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
         while let Some(row) = rows.next()? {
             let text: String = row.get(0)?;
-            for word in words(&text) {
+            for word in words(&text, min_chars) {
                 *counts.entry(word).or_insert(0) += 1;
             }
         }
@@ -1323,7 +1325,7 @@ mod tests {
     #[test]
     fn words_are_case_insensitive_and_keep_inner_hyphens() {
         let found: Vec<String> =
-            words("Окей, ОКЕЙ — что-то ещё! Don't 2026 3.5 'Slack' ёлка я ну").collect();
+            words("Окей, ОКЕЙ — что-то ещё! Don't 2026 3.5 'Slack' ёлка я ну", 3).collect();
         assert_eq!(
             found,
             ["окей", "окей", "что-то", "еще", "don't", "slack", "елка"],
@@ -1388,11 +1390,15 @@ mod tests {
         dictate(&conn, "a.wav", 1_000, "Вот, вот, нет. Вот!");
         dictate(&conn, "b.wav", 2_000, "нет ну");
 
-        let top = HistoryManager::top_words_with_conn(&conn, Some(1_000), 2).expect("top words");
+        let top =
+            HistoryManager::top_words_with_conn(&conn, Some(1_000), 2, 3).expect("top words");
         let pairs: Vec<(&str, i64)> = top.iter().map(|w| (w.word.as_str(), w.count)).collect();
         assert_eq!(pairs, [("вот", 3), ("нет", 2)]);
 
-        let all = HistoryManager::top_words_with_conn(&conn, None, 1).expect("all time");
+        let all = HistoryManager::top_words_with_conn(&conn, None, 1, 3).expect("all time");
         assert_eq!(all[0].word, "старое");
+
+        let long = HistoryManager::top_words_with_conn(&conn, Some(1_000), 1, 4).expect("4+");
+        assert!(long.is_empty(), "вот and нет are three letters");
     }
 }

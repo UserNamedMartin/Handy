@@ -582,8 +582,9 @@ older text but were deliberately not imported — statistics start in September.
 counts the raw transcripts in the overview's period — the toggle applies to it
 too. `words()` lowercases, folds `ё` to `е`, keeps inner hyphens and
 apostrophes (`что-то`, `don't`), drops tokens with no letter, and drops words
-under `MIN_WORD_CHARS` (3) — Martin's call, since one- and two-letter words
-("я", "и", "в", "не") filled the list. No stop-word list beyond that. Drawn as
+shorter than `min_chars`. The block has a 3+ / 4+ / 5+ letters toggle,
+default 4+ (not persisted — every open starts at 4+): at 3+ the list was "что",
+"вот", "это", "как", "так"; at 4+ real words get through. No stop-word list. Drawn as
 ranked bars scaled to the top word, the top three at full strength. It reads every transcript
 in the period on each open (in `spawn_blocking`); at ~5 MB of text a year that
 is fine for years — add a cached word table if the screen ever gets slow.

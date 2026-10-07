@@ -981,12 +981,12 @@ async getUsageSummary(since: number | null) : Promise<Result<UsageSummary, strin
 }
 },
 /**
- * The `limit` most frequent words in the transcripts since `since` (unix
- * seconds), or in all of them when `None`.
+ * The `limit` most frequent words of at least `min_chars` letters in the
+ * transcripts since `since` (unix seconds), or in all of them when `None`.
  */
-async getTopWords(since: number | null, limit: number | null) : Promise<Result<WordCount[], string>> {
+async getTopWords(since: number | null, limit: number | null, minChars: number | null) : Promise<Result<WordCount[], string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("get_top_words", { since, limit }) };
+    return { status: "ok", data: await TAURI_INVOKE("get_top_words", { since, limit, minChars }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };

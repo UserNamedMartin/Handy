@@ -672,6 +672,7 @@
       "allTime": "All time",
       "spent": "Spent",
       "topWords": "Most used words",
+      "minLetters": "{{count}}+ letters",
       "dictations": "dictations",
       "time": "Time",
       "cost": "Cost",
