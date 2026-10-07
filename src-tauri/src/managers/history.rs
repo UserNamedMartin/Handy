@@ -357,20 +357,23 @@ impl HistoryManager {
             .map_err(Into::into)
     }
 
-    /// Lifetime totals and the per-model split.
-    pub fn usage_summary(&self) -> Result<UsageSummary> {
+    /// Totals and the per-model split since `since` (unix seconds), or over
+    /// the whole ledger when `None`.
+    pub fn usage_summary(&self, since: Option<i64>) -> Result<UsageSummary> {
         let conn = self.get_connection()?;
-        Self::usage_summary_with_conn(&conn)
+        Self::usage_summary_with_conn(&conn, since)
     }
 
-    fn usage_summary_with_conn(conn: &Connection) -> Result<UsageSummary> {
+    fn usage_summary_with_conn(conn: &Connection, since: Option<i64>) -> Result<UsageSummary> {
+        let since = since.unwrap_or(0);
         let (dictations, seconds, cost_usd, measured) = conn.query_row(
             "SELECT COUNT(*),
                     COALESCE(SUM(duration_ms), 0) / 1000.0,
                     COALESCE(SUM(cost_usd), 0),
                     SUM(CASE WHEN duration_ms IS NOT NULL THEN 1 ELSE 0 END)
-             FROM usage_events",
-            [],
+             FROM usage_events
+             WHERE timestamp >= ?1",
+            params![since],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get::<_, Option<i64>>(3)?)),
         )?;
 
@@ -381,11 +384,12 @@ impl HistoryManager {
                     COALESCE(SUM(duration_ms), 0) / 1000.0 AS seconds,
                     COALESCE(SUM(cost_usd), 0) AS cost_usd
              FROM usage_events
+             WHERE timestamp >= ?1
              GROUP BY model_id, engine
              ORDER BY seconds DESC",
         )?;
         let per_model = stmt
-            .query_map([], |row| {
+            .query_map(params![since], |row| {
                 Ok(UsageByModel {
                     model_id: row.get("model_id")?,
                     engine: row.get("engine")?,
@@ -1114,7 +1118,7 @@ mod tests {
             insert_usage(&conn, ts, Some(30_000), Some(0.0045));
         }
 
-        let before = HistoryManager::usage_summary_with_conn(&conn).expect("summary before");
+        let before = HistoryManager::usage_summary_with_conn(&conn, None).expect("summary before");
         assert_eq!(before.dictations, 10);
         assert_eq!(before.measured, 10);
         assert!((before.seconds - 300.0).abs() < 1e-6);
@@ -1134,7 +1138,7 @@ mod tests {
             2
         );
 
-        let after = HistoryManager::usage_summary_with_conn(&conn).expect("summary after");
+        let after = HistoryManager::usage_summary_with_conn(&conn, None).expect("summary after");
         assert_eq!(
             after.dictations, before.dictations,
             "usage must survive the history cache being trimmed"
@@ -1151,7 +1155,7 @@ mod tests {
         insert_usage(&conn, 1_788_000_000, Some(12_000), Some(0.0018));
         insert_usage(&conn, 1_788_000_060, None, None);
 
-        let summary = HistoryManager::usage_summary_with_conn(&conn).expect("summary");
+        let summary = HistoryManager::usage_summary_with_conn(&conn, None).expect("summary");
         assert_eq!(summary.dictations, 2);
         assert_eq!(summary.measured, 1, "only one event carried a duration");
         assert!((summary.seconds - 12.0).abs() < 1e-6);

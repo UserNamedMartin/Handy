@@ -7,6 +7,17 @@ import { SettingsGroup } from "../../ui/SettingsGroup";
 const RANGES = [7, 30, 90] as const;
 type Range = (typeof RANGES)[number];
 
+/** What the overview totals cover. */
+type Period = "all" | "month";
+
+/** Unix seconds at local midnight on the 1st of the current month. */
+const startOfMonth = (): number => {
+  const now = new Date();
+  return Math.floor(
+    new Date(now.getFullYear(), now.getMonth(), 1).getTime() / 1000,
+  );
+};
+
 const formatDuration = (seconds: number): string => {
   if (seconds < 60) return `${Math.round(seconds)}s`;
   const minutes = seconds / 60;
@@ -97,7 +108,9 @@ const DailyChart: React.FC<{ buckets: UsageBucket[] }> = ({ buckets }) => {
                 }`}
                 // Keep an empty day visible as a hairline so the axis reads as
                 // continuous rather than gappy.
-                style={{ height: `${Math.max(height, bucket.seconds > 0 ? 2 : 1)}%` }}
+                style={{
+                  height: `${Math.max(height, bucket.seconds > 0 ? 2 : 1)}%`,
+                }}
               />
             </div>
           );
@@ -122,6 +135,8 @@ export const UsageSettings: React.FC = () => {
   const [daily, setDaily] = useState<UsageBucket[]>([]);
   const [monthly, setMonthly] = useState<UsageBucket[]>([]);
   const [summary, setSummary] = useState<UsageSummary | null>(null);
+  const [period, setPeriod] = useState<Period>("all");
+  const [overview, setOverview] = useState<UsageSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -130,7 +145,7 @@ export const UsageSettings: React.FC = () => {
       const [d, m, s] = await Promise.all([
         commands.getUsageDaily(90),
         commands.getUsageMonthly(12),
-        commands.getUsageSummary(),
+        commands.getUsageSummary(null),
       ]);
       if (cancelled) return;
       if (d.status === "ok") setDaily(d.data);
@@ -142,6 +157,21 @@ export const UsageSettings: React.FC = () => {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const s = await commands.getUsageSummary(
+        period === "month" ? startOfMonth() : null,
+      );
+      if (cancelled) return;
+      if (s.status === "ok") setOverview(s.data);
+      else setError(s.error);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [period]);
 
   const windowed = useMemo(() => fillDays(daily, range), [daily, range]);
 
@@ -158,13 +188,14 @@ export const UsageSettings: React.FC = () => {
     [windowed],
   );
 
-  const thisMonth = monthly[monthly.length - 1];
   const paid = summary?.per_model.filter((m) => m.engine === "cloud") ?? [];
   // Older entries predate usage recording; averaging over all of them would
   // understate the true average length.
   const avgSeconds =
-    summary && summary.measured > 0 ? summary.seconds / summary.measured : 0;
-  const unmeasured = summary ? summary.dictations - summary.measured : 0;
+    overview && overview.measured > 0
+      ? overview.seconds / overview.measured
+      : 0;
+  const unmeasured = overview ? overview.dictations - overview.measured : 0;
 
   if (error) {
     return (
@@ -176,24 +207,46 @@ export const UsageSettings: React.FC = () => {
 
   return (
     <div className="flex flex-col gap-4">
-      <SettingsGroup title={t("settings.usage.overview")}>
+      <SettingsGroup
+        title={t("settings.usage.overview")}
+        action={
+          <div className="flex gap-1">
+            {(["all", "month"] as const).map((option) => (
+              <button
+                key={option}
+                onClick={() => setPeriod(option)}
+                className={`px-2 py-0.5 rounded text-xs transition-colors cursor-pointer ${
+                  period === option
+                    ? "bg-logo-primary/20 text-logo-primary"
+                    : "text-text/50 hover:text-text"
+                }`}
+              >
+                {t(
+                  option === "all"
+                    ? "settings.usage.allTime"
+                    : "settings.usage.thisMonth",
+                )}
+              </button>
+            ))}
+          </div>
+        }
+      >
         <div className="flex flex-wrap gap-2 px-3 py-3">
           <Stat
             label={t("settings.usage.totalDictations")}
-            value={summary ? summary.dictations.toLocaleString() : "—"}
+            value={overview ? overview.dictations.toLocaleString() : "—"}
           />
           <Stat
             label={t("settings.usage.totalTime")}
-            value={summary ? formatDuration(summary.seconds) : "—"}
+            value={overview ? formatDuration(overview.seconds) : "—"}
           />
           <Stat
             label={t("settings.usage.averageLength")}
             value={avgSeconds ? formatDuration(avgSeconds) : "—"}
           />
           <Stat
-            label={t("settings.usage.thisMonth")}
-            value={thisMonth ? formatCost(thisMonth.cost_usd) : "$0"}
-            hint={thisMonth ? formatDuration(thisMonth.seconds) : undefined}
+            label={t("settings.usage.spent")}
+            value={overview ? formatCost(overview.cost_usd) : "—"}
           />
         </div>
         {unmeasured > 0 && (
@@ -207,8 +260,8 @@ export const UsageSettings: React.FC = () => {
         <div className="px-3 py-3">
           <div className="mb-3 flex items-center justify-between">
             <div className="text-xs text-text/50">
-              {formatDuration(windowTotals.seconds)} ·{" "}
-              {windowTotals.dictations} {t("settings.usage.dictations")}
+              {formatDuration(windowTotals.seconds)} · {windowTotals.dictations}{" "}
+              {t("settings.usage.dictations")}
               {windowTotals.cost > 0 && ` · ${formatCost(windowTotals.cost)}`}
             </div>
             <div className="flex gap-1">
@@ -239,7 +292,9 @@ export const UsageSettings: React.FC = () => {
             <table className="w-full text-sm table-fixed">
               <thead>
                 <tr className="text-xs text-text/40 text-left">
-                  <th className="font-normal py-1">{t("settings.usage.model")}</th>
+                  <th className="font-normal py-1">
+                    {t("settings.usage.model")}
+                  </th>
                   <th className="font-normal py-1 text-right w-[4.5rem]">
                     {t("settings.usage.dictations")}
                   </th>
@@ -253,7 +308,10 @@ export const UsageSettings: React.FC = () => {
               </thead>
               <tbody>
                 {summary.per_model.map((model) => (
-                  <tr key={`${model.model_id}:${model.engine}`} className="border-t border-mid-gray/20">
+                  <tr
+                    key={`${model.model_id}:${model.engine}`}
+                    className="border-t border-mid-gray/20"
+                  >
                     <td className="py-1.5 pr-3 min-w-0">
                       <div className="flex items-center gap-1.5 min-w-0">
                         <span
@@ -278,14 +336,18 @@ export const UsageSettings: React.FC = () => {
                       {formatDuration(model.seconds)}
                     </td>
                     <td className="py-1.5 text-right tabular-nums text-text/60">
-                      {model.engine === "cloud" ? formatCost(model.cost_usd) : "—"}
+                      {model.engine === "cloud"
+                        ? formatCost(model.cost_usd)
+                        : "—"}
                     </td>
                   </tr>
                 ))}
               </tbody>
             </table>
           ) : (
-            <div className="py-2 text-sm text-text/50">{t("settings.usage.empty")}</div>
+            <div className="py-2 text-sm text-text/50">
+              {t("settings.usage.empty")}
+            </div>
           )}
         </div>
       </SettingsGroup>
@@ -293,12 +355,16 @@ export const UsageSettings: React.FC = () => {
       <SettingsGroup title={t("settings.usage.spend")}>
         <div className="px-3 py-2">
           {paid.length === 0 ? (
-            <div className="py-2 text-sm text-text/50">{t("settings.usage.noSpend")}</div>
+            <div className="py-2 text-sm text-text/50">
+              {t("settings.usage.noSpend")}
+            </div>
           ) : (
             <table className="w-full text-sm table-fixed">
               <thead>
                 <tr className="text-xs text-text/40 text-left">
-                  <th className="font-normal py-1">{t("settings.usage.month")}</th>
+                  <th className="font-normal py-1">
+                    {t("settings.usage.month")}
+                  </th>
                   <th className="font-normal py-1 text-right w-[4.5rem]">
                     {t("settings.usage.dictations")}
                   </th>
@@ -312,8 +378,13 @@ export const UsageSettings: React.FC = () => {
               </thead>
               <tbody>
                 {[...monthly].reverse().map((month) => (
-                  <tr key={month.period} className="border-t border-mid-gray/20">
-                    <td className="py-1.5 tabular-nums text-text">{month.period}</td>
+                  <tr
+                    key={month.period}
+                    className="border-t border-mid-gray/20"
+                  >
+                    <td className="py-1.5 tabular-nums text-text">
+                      {month.period}
+                    </td>
                     <td className="py-1.5 text-right tabular-nums text-text/60">
                       {month.dictations}
                     </td>

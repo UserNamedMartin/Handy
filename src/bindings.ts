@@ -972,9 +972,9 @@ async getUsageMonthly(months: number | null) : Promise<Result<UsageBucket[], str
 /**
  * Lifetime totals plus the per-model split.
  */
-async getUsageSummary() : Promise<Result<UsageSummary, string>> {
+async getUsageSummary(since: number | null) : Promise<Result<UsageSummary, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("get_usage_summary") };
+    return { status: "ok", data: await TAURI_INVOKE("get_usage_summary", { since }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };

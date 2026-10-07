@@ -206,11 +206,15 @@ pub async fn get_usage_monthly(
         .map_err(|e| e.to_string())
 }
 
-/// Lifetime totals plus the per-model split.
+/// Totals plus the per-model split since `since` (unix seconds; the start of
+/// the month for the overview's "this month"), or lifetime when `None`.
 #[tauri::command]
 #[specta::specta]
 pub async fn get_usage_summary(
     history_manager: State<'_, Arc<HistoryManager>>,
+    since: Option<i64>,
 ) -> Result<UsageSummary, String> {
-    history_manager.usage_summary().map_err(|e| e.to_string())
+    history_manager
+        .usage_summary(since)
+        .map_err(|e| e.to_string())
 }

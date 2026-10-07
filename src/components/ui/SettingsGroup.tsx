@@ -3,21 +3,27 @@ import React from "react";
 interface SettingsGroupProps {
   title?: string;
   description?: string;
+  /** Rendered at the right end of the title row. */
+  action?: React.ReactNode;
   children: React.ReactNode;
 }
 
 export const SettingsGroup: React.FC<SettingsGroupProps> = ({
   title,
   description,
+  action,
   children,
 }) => {
   return (
     <div className="space-y-2">
       {title && (
         <div className="px-4">
-          <h2 className="text-xs font-medium text-mid-gray uppercase tracking-wide">
-            {title}
-          </h2>
+          <div className="flex items-center justify-between gap-2">
+            <h2 className="text-xs font-medium text-mid-gray uppercase tracking-wide">
+              {title}
+            </h2>
+            {action}
+          </div>
           {description && (
             <p className="text-xs text-mid-gray mt-1">{description}</p>
           )}

@@ -552,7 +552,11 @@ that ordering is pinned by a test rather than by care.
 `usage_daily` / `usage_monthly` / `usage_summary` aggregate in SQL (local-time
 day and month buckets); commands are in `commands/history.rs`. The UI
 (`components/settings/usage/UsageSettings.tsx`) shows totals, a daily activity
-chart, a per-model split and a monthly spend retrospective.
+chart, a per-model split and a monthly spend retrospective. The overview has an
+All time / This month toggle (`get_usage_summary(since)`, the month starting at
+local midnight on the 1st); the per-model table stays lifetime. The ledger
+starts in September 2026: the three August rows (the starred survivors of the
+seed) were deleted by hand on 2026-10-07 at Martin's request.
 
 **Costs are estimates.** No provider exposes a spend API — Google's billing lives
 in Cloud Console — so `cloud::estimate_cost_usd` multiplies billed duration by the
