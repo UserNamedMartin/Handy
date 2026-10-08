@@ -1,7 +1,9 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   commands,
+  events,
   type UsageBucket,
   type UsageSummary,
   type WordCount,
@@ -191,6 +193,26 @@ export const UsageSettings: React.FC = () => {
   const [topWords, setTopWords] = useState<WordCount[]>([]);
   const [minWordLength, setMinWordLength] = useState<MinWordLength>(4);
   const [error, setError] = useState<string | null>(null);
+  // Bumped to re-fetch everything. Closing the window only hides it — this
+  // screen stays mounted — so loading once on mount showed numbers from
+  // whenever the tab was first opened.
+  const [refreshKey, setRefreshKey] = useState(0);
+
+  useEffect(() => {
+    const refresh = () => setRefreshKey((key) => key + 1);
+    // A dictation (or a retry, or a delete) changed the data.
+    const unlistenHistory = events.historyUpdatePayload.listen(refresh);
+    // The window came back from hidden or from behind another app.
+    const unlistenFocus = getCurrentWindow().onFocusChanged(
+      ({ payload: focused }) => {
+        if (focused) refresh();
+      },
+    );
+    return () => {
+      unlistenHistory.then((fn) => fn());
+      unlistenFocus.then((fn) => fn());
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -209,7 +231,7 @@ export const UsageSettings: React.FC = () => {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [refreshKey]);
 
   useEffect(() => {
     let cancelled = false;
@@ -224,7 +246,7 @@ export const UsageSettings: React.FC = () => {
     return () => {
       cancelled = true;
     };
-  }, [period]);
+  }, [period, refreshKey]);
 
   useEffect(() => {
     let cancelled = false;
@@ -240,7 +262,7 @@ export const UsageSettings: React.FC = () => {
     return () => {
       cancelled = true;
     };
-  }, [period, minWordLength]);
+  }, [period, minWordLength, refreshKey]);
 
   const windowed = useMemo(() => fillDays(daily, range), [daily, range]);
 

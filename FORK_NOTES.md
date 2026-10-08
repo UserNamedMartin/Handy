@@ -588,7 +588,10 @@ default 4+ (not persisted — every open starts at 4+): at 3+ the list was "чт
 toggles on the Usage screen (period, activity range, word length) are one
 `Segmented` component in `UsageSettings.tsx` — change their look there. The
 chosen option is filled brand pink with dark text: the pink is light in both
-themes, so white text on it was unreadable. Drawn as
+themes, so white text on it was unreadable. The screen re-fetches on window focus
+and on every `history-update-payload` event: closing the window only hides it,
+so a load-on-mount screen kept showing the numbers from when the tab was first
+opened. Drawn as
 ranked bars scaled to the top word, the top three at full strength. It reads every transcript
 in the period on each open (in `spawn_blocking`); at ~5 MB of text a year that
 is fine for years — add a cached word table if the screen ever gets slow.
