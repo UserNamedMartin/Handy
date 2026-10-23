@@ -377,6 +377,66 @@ so inline stays the path for clips that fit. Uploads expire server-side after
 48 h; we delete ours immediately after use, before unwrapping the transcription
 result, so a failed request leaves nothing behind.
 
+### Two ways to reach Gemini: AI Studio key or Vertex AI
+Both Gemini models (batch and Live) can be reached through **Google AI Studio**
+(an `AIza…` key, the original path) or **Google Cloud Vertex AI** (OAuth
+credentials). Neither replaces the other: the models, the transcription knobs and
+the overlay behaviour are identical, and the choice is one setting —
+`gemini_transcribe.connection` (`ai_studio` | `vertex`), shown as the
+*Connection* row at the top of the Gemini settings card. What differs is who
+pays: an AI Studio key bills its own project's free tier or prepaid balance,
+while Vertex bills a Cloud project's billing account — the only route that Google
+Cloud credits, the $300 free trial included, ever pay for. Added 2026-10-23, when
+the AI Studio prepaid balance ran dry mid-day and every dictation came back 402.
+
+- **`GeminiRoute`** (`cloud/gemini.rs`) carries the difference, built per
+  dictation by `gemini_route()` in `managers/transcription.rs`, so a settings
+  change applies on the next dictation without reloading the engine. The batch
+  engine and `GeminiLiveSession::connect` both take it; everything past the
+  endpoint and auth is shared code.
+- **Batch on Vertex** is `generateContent` at `aiplatform.googleapis.com`,
+  location **`global`** — the regional hosts 404 for these models, and so does
+  `gemini-2.5-flash` everywhere. Config goes in
+  `generationConfig.audioTranscriptionConfig` (`mode` as `"SMART"`/`"VERBATIM"`,
+  `languageCodes`, `customVocabulary`, flat `diarization` / `wordTimestamp`), all
+  verified live. With speaker labels the answer is one part per speaker turn.
+  **No upload step:** a 10.6-minute dictation went through as one 27 MB inline
+  request in 8.7 s, and Google documents 15 minutes as the synchronous limit.
+  Measured on a 15.7 s clip: 1.24 s, against AI Studio's ~3 s floor.
+- **Live on Vertex** is the identical protocol at
+  `wss://aiplatform.googleapis.com/ws/google.cloud.aiplatform.v1.LlmBidiService/BidiGenerateContent`,
+  with `Authorization: Bearer` instead of `?key=` and the model named
+  `projects/<p>/locations/global/publishers/google/models/gemini-3.5-transcribe-live`.
+  Feeding audio much faster than real time gets the socket closed with
+  `1011 Client overran StreamHandler internal queue size` — irrelevant for a
+  microphone, but it is why the ~210 s ceiling (see above) has **not** been
+  re-measured on Vertex; the cap applies to both routes until it is.
+- **Why OAuth, not an API key:** Vertex refuses a plain key ("API keys are not
+  supported by this API"), and a key bound to a service account is blocked by the
+  default org policy `iam.managed.disableServiceAccountApiKeyCreation`.
+  `cloud/google_oauth.rs` reads an `authorized_user` file — what
+  `gcloud auth application-default login` writes — and trades its refresh token
+  for one-hour access tokens, cached and shared across dictations (keyed by path
+  and mtime, so a fresh login is picked up without a restart). Settings store
+  only the **path** (`vertex_credentials`) and the project ID
+  (`vertex_project`), never the token. Service-account files are refused with a
+  message: they would need RS256 signing for a credential this fork does not use.
+  Every request also sends `x-goog-user-project`, so quota is charged to the
+  project the URL names rather than gcloud's shared client project.
+- A Live session refused at setup now logs the server's close reason
+  (`Gemini Live refused the session (code …: …)`). It used to parse the empty
+  close frame as JSON and log `EOF while parsing a value`, which hid the 402.
+- End-to-end check through the app's own code, without launching the app:
+  `HANDY_SMOKE_WAV=… HANDY_SMOKE_VERTEX_PROJECT=… HANDY_SMOKE_VERTEX_CREDENTIALS=…
+  cargo test --lib live_smoke -- --ignored --nocapture` (drop the Vertex
+  variables and set `HANDY_GEMINI_API_KEY` for the AI Studio route).
+
+Martin's Vertex setup: project `hip-computer-512511-m2` on a $300 free-trial
+billing account, credentials at
+`~/.config/gcp-gemini/gcloud/application_default_credentials.json` (a gcloud
+config dir of its own, `CLOUDSDK_CONFIG=~/.config/gcp-gemini/gcloud`, so the
+machine's default gcloud login is untouched).
+
 ### The usage ledger now sees every billed request
 Two kinds of spend used to be invisible, both of them the expensive kind:
 - **A discarded Live attempt.** A dictation past the ceiling pays for Live *and*

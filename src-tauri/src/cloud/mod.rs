@@ -14,6 +14,7 @@
 pub mod elevenlabs;
 pub mod gemini;
 pub mod gemini_live;
+pub mod google_oauth;
 
 use anyhow::{anyhow, Result};
 use std::future::Future;

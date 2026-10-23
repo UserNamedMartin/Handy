@@ -1,8 +1,9 @@
 import React, { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import type { GeminiTranscribeMode } from "@/bindings";
+import type { GeminiConnection, GeminiTranscribeMode } from "@/bindings";
 import { useSettings } from "../../../hooks/useSettings";
 import { Input } from "../../ui/Input";
+import { Segmented } from "../../ui/Segmented";
 import { ToggleSwitch } from "../../ui/ToggleSwitch";
 
 const GEMINI_PROVIDER = "gemini";
@@ -82,6 +83,35 @@ const ApiKeyRow: React.FC<{
 };
 
 /**
+ * A free-text field that saves on blur, so typing a path or an ID does not
+ * write the settings store on every keystroke.
+ */
+const TextRow: React.FC<{
+  label: string;
+  hint: string;
+  stored: string;
+  placeholder: string;
+  onSave: (value: string) => void;
+}> = ({ label, hint, stored, placeholder, onSave }) => {
+  const [value, setValue] = useState(stored);
+
+  useEffect(() => setValue(stored), [stored]);
+
+  return (
+    <Row label={label} hint={hint}>
+      <Input
+        variant="compact"
+        value={value}
+        placeholder={placeholder}
+        onChange={(event) => setValue(event.target.value)}
+        onBlur={() => onSave(value.trim())}
+        className="flex-1 max-w-[320px]"
+      />
+    </Row>
+  );
+};
+
+/**
  * Settings that belong to the Gemini cloud models specifically — knobs no local
  * engine has.
  *
@@ -130,13 +160,57 @@ export const CloudModelSettings: React.FC = () => {
   // disables smart mode's cleanup. Worth saying out loud — it reads as a bug.
   const languagesSuppressSmart = smart && parseList(languages).length > 0;
 
+  // Both connections serve the same models with the same knobs below; only
+  // the credentials differ, so only these rows swap.
+  const vertex = config.connection === "vertex";
+
   return (
     <>
-      <ApiKeyRow
-        provider={GEMINI_PROVIDER}
-        placeholder="AIza…"
-        hint={t("settings.models.cloud.apiKeyHint")}
-      />
+      <Row
+        label={t("settings.models.cloud.connection")}
+        hint={
+          vertex
+            ? t("settings.models.cloud.connectionVertexHint")
+            : t("settings.models.cloud.connectionAiStudioHint")
+        }
+      >
+        <Segmented
+          options={
+            [
+              "ai_studio",
+              "vertex",
+            ] as const satisfies readonly GeminiConnection[]
+          }
+          value={config.connection}
+          onChange={(connection) => patch({ connection })}
+          label={(option) => t(`settings.models.cloud.connection_${option}`)}
+        />
+      </Row>
+
+      {vertex ? (
+        <>
+          <TextRow
+            label={t("settings.models.cloud.vertexProject")}
+            hint={t("settings.models.cloud.vertexProjectHint")}
+            stored={config.vertex_project}
+            placeholder="my-project-123456"
+            onSave={(vertex_project) => patch({ vertex_project })}
+          />
+          <TextRow
+            label={t("settings.models.cloud.vertexCredentials")}
+            hint={t("settings.models.cloud.vertexCredentialsHint")}
+            stored={config.vertex_credentials}
+            placeholder="~/.config/gcloud/application_default_credentials.json"
+            onSave={(vertex_credentials) => patch({ vertex_credentials })}
+          />
+        </>
+      ) : (
+        <ApiKeyRow
+          provider={GEMINI_PROVIDER}
+          placeholder="AIza…"
+          hint={t("settings.models.cloud.apiKeyHint")}
+        />
+      )}
 
       <Row
         label={t("settings.models.cloud.mode")}
@@ -146,21 +220,17 @@ export const CloudModelSettings: React.FC = () => {
             : t("settings.models.cloud.modeVerbatimHint")
         }
       >
-        <div className="flex gap-1">
-          {(["smart", "verbatim"] as GeminiTranscribeMode[]).map((option) => (
-            <button
-              key={option}
-              onClick={() => patch({ mode: option })}
-              className={`px-2.5 py-1 rounded text-xs transition-colors cursor-pointer ${
-                config.mode === option
-                  ? "bg-logo-primary/20 text-logo-primary"
-                  : "text-text/50 hover:text-text"
-              }`}
-            >
-              {t(`settings.models.cloud.mode_${option}`)}
-            </button>
-          ))}
-        </div>
+        <Segmented
+          options={
+            [
+              "smart",
+              "verbatim",
+            ] as const satisfies readonly GeminiTranscribeMode[]
+          }
+          value={config.mode}
+          onChange={(mode) => patch({ mode })}
+          label={(option) => t(`settings.models.cloud.mode_${option}`)}
+        />
       </Row>
 
       <Row

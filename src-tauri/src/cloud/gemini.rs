@@ -7,16 +7,24 @@
 //! variant *behind* the batch one (4.0% vs 2.6% AA-WER, 5.50% vs 5.04% FLEURS),
 //! and batch already returns in well under a second for dictation-length audio.
 //!
-//! Docs: <https://ai.google.dev/gemini-api/docs/transcribe>
+//! The same model is reachable two ways — see [`GeminiRoute`]. Google AI Studio
+//! takes an API key and the Interactions API; Vertex AI takes an OAuth token
+//! and `generateContent`. Both stay supported side by side: they differ only in
+//! who pays, so the choice is a setting, not a separate model.
+//!
+//! Docs: <https://ai.google.dev/gemini-api/docs/transcribe> (AI Studio),
+//! <https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/3-5-transcribe> (Vertex)
 
 use anyhow::{anyhow, Result};
 use base64::Engine as _;
 use log::{debug, warn};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::sync::Arc;
 use std::time::Duration;
 
-use crate::settings::{GeminiTranscribeMode, GeminiTranscribeSettings};
+use super::google_oauth::VertexCredentials;
+use crate::settings::{GeminiConnection, GeminiTranscribeMode, GeminiTranscribeSettings};
 
 /// Provider key under `AppSettings::cloud_api_keys`, and the prefix of the
 /// catalog id for every model this backend serves.
@@ -72,6 +80,76 @@ const WAV_MIME: &str = "audio/wav";
 /// so a large `custom_words` list can never 400 the request.
 const MAX_CUSTOM_VOCABULARY: usize = 1000;
 
+/// Vertex host for the `global` location. Every Gemini model this fork uses is
+/// served only there: the regional hosts (`us-central1-…`) answer 404 for them.
+pub(super) const VERTEX_HOST: &str = "aiplatform.googleapis.com";
+
+/// The location segment that goes with [`VERTEX_HOST`].
+pub(super) const VERTEX_LOCATION: &str = "global";
+
+/// Full Vertex resource name of a Google model in `project`.
+pub(super) fn vertex_model_path(project: &str, model: &str) -> String {
+    format!(
+        "projects/{}/locations/{}/publishers/google/models/{}",
+        project, VERTEX_LOCATION, model
+    )
+}
+
+/// How a request reaches Gemini, and therefore who is billed for it.
+#[derive(Clone)]
+pub enum GeminiRoute {
+    /// Gemini Developer API with an `AIza…` key. Billed to the key's AI Studio
+    /// project — its free tier or its own prepaid balance.
+    AiStudio { api_key: String },
+    /// Vertex AI with an OAuth token. Billed to `project`'s Cloud billing
+    /// account, which is what Google Cloud credits (the $300 trial included)
+    /// pay for.
+    Vertex {
+        project: String,
+        credentials: Arc<VertexCredentials>,
+    },
+}
+
+impl GeminiRoute {
+    /// Build the route the settings ask for, failing with a message that names
+    /// the missing setting. `stored_key` is the AI Studio key from
+    /// `cloud_api_keys`; it is ignored on the Vertex route.
+    pub fn from_settings(config: &GeminiTranscribeSettings, stored_key: &str) -> Result<Self> {
+        match config.connection {
+            GeminiConnection::AiStudio => {
+                let api_key = resolve_api_key(stored_key);
+                if api_key.is_empty() {
+                    return Err(anyhow!(
+                        "No Gemini API key configured. Add one in Settings → Gemini, or switch the connection to Vertex AI."
+                    ));
+                }
+                Ok(Self::AiStudio { api_key })
+            }
+            GeminiConnection::Vertex => {
+                let project = config.vertex_project.trim().to_string();
+                if project.is_empty() {
+                    return Err(anyhow!(
+                        "No Vertex project configured. Set the project ID in Settings → Gemini → Vertex AI."
+                    ));
+                }
+                let credentials = VertexCredentials::shared(&config.vertex_credentials)?;
+                Ok(Self::Vertex {
+                    project,
+                    credentials,
+                })
+            }
+        }
+    }
+
+    /// For logs: which wallet a request was charged to.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::AiStudio { .. } => "AI Studio",
+            Self::Vertex { .. } => "Vertex AI",
+        }
+    }
+}
+
 /// A file the Files API is holding for us.
 struct UploadedFile {
     uri: String,
@@ -87,23 +165,16 @@ enum AudioRef {
     Uploaded(UploadedFile),
 }
 
-/// A cloud "engine". Holds no model — just the HTTP client and the credentials
-/// and model id it was configured with.
+/// A cloud "engine". Holds no model — just the HTTP client and the route and
+/// model id it was configured with.
 pub struct GeminiTranscriber {
     client: reqwest::Client,
-    api_key: String,
+    route: GeminiRoute,
     model: String,
 }
 
 impl GeminiTranscriber {
-    pub fn new(api_key: String, model: String) -> Result<Self> {
-        let api_key = resolve_api_key(&api_key);
-        if api_key.is_empty() {
-            return Err(anyhow!(
-                "No Gemini API key configured. Add one in Settings → Models → Gemini 3.5 Transcribe."
-            ));
-        }
-
+    pub fn new(route: GeminiRoute, model: String) -> Result<Self> {
         let client = reqwest::Client::builder()
             // Generous relative to the sub-second median, but bounded: a hung
             // request must not leave the user staring at the overlay.
@@ -113,7 +184,7 @@ impl GeminiTranscriber {
 
         Ok(Self {
             client,
-            api_key,
+            route,
             model,
         })
     }
@@ -133,8 +204,27 @@ impl GeminiTranscriber {
         }
 
         let wav = super::encode_wav_16k(audio)?;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(&wav);
-        let seconds = audio.len() as f64 / SAMPLE_RATE as f64;
+        match &self.route {
+            GeminiRoute::AiStudio { api_key } => {
+                self.transcribe_ai_studio(api_key, &wav, config, language, custom_words)
+            }
+            GeminiRoute::Vertex {
+                project,
+                credentials,
+            } => self.transcribe_vertex(project, credentials, &wav, config, language, custom_words),
+        }
+    }
+
+    fn transcribe_ai_studio(
+        &self,
+        api_key: &str,
+        wav: &[u8],
+        config: &GeminiTranscribeSettings,
+        language: &str,
+        custom_words: &[String],
+    ) -> Result<String> {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(wav);
+        let seconds = wav_seconds(wav);
 
         // A clip that does not fit inline is uploaded rather than refused. This
         // used to be a hard error at roughly seven minutes, which also made the
@@ -145,7 +235,7 @@ impl GeminiTranscriber {
                 "Gemini transcribe: {:.1}s of audio exceeds the inline budget; uploading",
                 seconds
             );
-            AudioRef::Uploaded(self.upload_wav(&wav)?)
+            AudioRef::Uploaded(self.upload_wav(api_key, wav)?)
         } else {
             AudioRef::Inline(encoded)
         };
@@ -153,7 +243,7 @@ impl GeminiTranscriber {
         let body = self.build_request(&audio_ref, config, language, custom_words);
 
         debug!(
-            "Gemini transcribe: model={}, audio={:.1}s, via={}",
+            "Gemini transcribe: model={}, audio={:.1}s, route=AI Studio, via={}",
             self.model,
             seconds,
             match &audio_ref {
@@ -165,40 +255,63 @@ impl GeminiTranscriber {
         let request = self
             .client
             .post(INTERACTIONS_URL)
-            .header("x-goog-api-key", &self.api_key)
+            .header("x-goog-api-key", api_key)
             .header("Api-Revision", API_REVISION)
             .json(&body);
 
-        let response = crate::cloud::block_on(async move {
-            let response = request
-                .send()
-                .await
-                .map_err(|e| anyhow!("Gemini request failed: {}", e))?;
-
-            let status = response.status();
-            let text = response
-                .text()
-                .await
-                .map_err(|e| anyhow!("Failed to read Gemini response: {}", e))?;
-
-            if !status.is_success() {
-                return Err(anyhow!(
-                    "Gemini returned {}: {}",
-                    status,
-                    describe_api_error(&text)
-                ));
-            }
-
-            Ok(text)
-        });
+        let response = send_for_text(request);
 
         // Delete before unwrapping the result: the file is ours either way, and
         // a failed transcription should not leave it behind.
         if let AudioRef::Uploaded(file) = &audio_ref {
-            self.delete_file(&file.name);
+            self.delete_file(api_key, &file.name);
         }
 
         extract_transcript(&response?)
+    }
+
+    /// Vertex AI: one `generateContent` call with the WAV inline.
+    ///
+    /// No upload step, unlike AI Studio: Vertex has no Files API (its
+    /// equivalent is a Cloud Storage bucket), and it does not need one —
+    /// measured, a 10.6-minute dictation went through as a single 27 MB inline
+    /// request in 8.7 s. Google documents 15 minutes as the model's limit for a
+    /// synchronous request, past anything Handy has recorded.
+    fn transcribe_vertex(
+        &self,
+        project: &str,
+        credentials: &VertexCredentials,
+        wav: &[u8],
+        config: &GeminiTranscribeSettings,
+        language: &str,
+        custom_words: &[String],
+    ) -> Result<String> {
+        let token = credentials.access_token()?;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(wav);
+        debug!(
+            "Gemini transcribe: model={}, audio={:.1}s, route=Vertex AI ({}), inline {} KB",
+            self.model,
+            wav_seconds(wav),
+            project,
+            encoded.len() / 1024
+        );
+
+        let body = build_vertex_request(&encoded, config, language, custom_words);
+        let url = format!(
+            "https://{}/v1/{}:generateContent",
+            VERTEX_HOST,
+            vertex_model_path(project, &self.model)
+        );
+        let request = self
+            .client
+            .post(url)
+            .bearer_auth(token)
+            // Bill quota to the same project the URL names; user credentials
+            // otherwise fall back to gcloud's own shared client project.
+            .header("x-goog-user-project", project)
+            .json(&body);
+
+        extract_vertex_transcript(&send_for_text(request)?)
     }
 
     /// Hand the WAV to the Files API and return the handle to reference it by.
@@ -208,11 +321,11 @@ impl GeminiTranscriber {
     /// itself, so it is only worth doing for clips that cannot go inline.
     /// Uploads expire on the service after 48 h; we delete ours immediately
     /// after use anyway.
-    fn upload_wav(&self, wav: &[u8]) -> Result<UploadedFile> {
+    fn upload_wav(&self, api_key: &str, wav: &[u8]) -> Result<UploadedFile> {
         let start = self
             .client
             .post(UPLOAD_URL)
-            .header("x-goog-api-key", &self.api_key)
+            .header("x-goog-api-key", api_key)
             .header("X-Goog-Upload-Protocol", "resumable")
             .header("X-Goog-Upload-Command", "start")
             .header("X-Goog-Upload-Header-Content-Length", wav.len().to_string())
@@ -279,11 +392,11 @@ impl GeminiTranscriber {
 
     /// Best-effort cleanup — the service expires uploads on its own, so a
     /// failure here costs a log line and nothing else.
-    fn delete_file(&self, name: &str) {
+    fn delete_file(&self, api_key: &str, name: &str) {
         let request = self
             .client
             .delete(format!("{}/{}", FILES_BASE, name))
-            .header("x-goog-api-key", &self.api_key);
+            .header("x-goog-api-key", api_key);
 
         let outcome = crate::cloud::block_on(async move {
             request
@@ -345,6 +458,111 @@ impl GeminiTranscriber {
             },
         })
     }
+}
+
+/// Send a request and return its body, turning a non-2xx status into an error
+/// that carries Google's own message.
+fn send_for_text(request: reqwest::RequestBuilder) -> Result<String> {
+    crate::cloud::block_on(async move {
+        let response = request
+            .send()
+            .await
+            .map_err(|e| anyhow!("Gemini request failed: {}", e))?;
+
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .map_err(|e| anyhow!("Failed to read Gemini response: {}", e))?;
+
+        if !status.is_success() {
+            return Err(anyhow!(
+                "Gemini returned {}: {}",
+                status,
+                describe_api_error(&text)
+            ));
+        }
+
+        Ok(text)
+    })
+}
+
+/// Audio length of a 16 kHz mono 16-bit WAV, for log lines.
+fn wav_seconds(wav: &[u8]) -> f64 {
+    wav.len().saturating_sub(44) as f64 / (SAMPLE_RATE as f64 * 2.0)
+}
+
+/// The Vertex `generateContent` body.
+///
+/// Same knobs as the Interactions request, spelled the way Vertex wants them:
+/// `generationConfig.audioTranscriptionConfig`, camelCase, `mode` as an enum
+/// string, and `diarization` / `wordTimestamp` as flat booleans — all verified
+/// against the live service. Smart mode drops the two Verbatim-only options for
+/// the same reason [`build_mode`] does.
+fn build_vertex_request(
+    encoded_wav: &str,
+    config: &GeminiTranscribeSettings,
+    language: &str,
+    custom_words: &[String],
+) -> Value {
+    let mut transcription = serde_json::Map::new();
+    transcription.insert(
+        "languageCodes".to_string(),
+        json!(resolve_language_codes(config, language)),
+    );
+
+    let vocabulary = resolve_custom_vocabulary(config, custom_words);
+    if !vocabulary.is_empty() {
+        transcription.insert("customVocabulary".to_string(), json!(vocabulary));
+    }
+
+    match config.mode {
+        GeminiTranscribeMode::Smart => {
+            transcription.insert("mode".to_string(), json!("SMART"));
+        }
+        GeminiTranscribeMode::Verbatim => {
+            transcription.insert("mode".to_string(), json!("VERBATIM"));
+            if config.diarization {
+                transcription.insert("diarization".to_string(), json!(true));
+            }
+            if config.timestamps {
+                transcription.insert("wordTimestamp".to_string(), json!(true));
+            }
+        }
+    }
+
+    json!({
+        "contents": [{
+            "role": "user",
+            "parts": [{ "inlineData": { "mimeType": WAV_MIME, "data": encoded_wav } }],
+        }],
+        "generationConfig": { "audioTranscriptionConfig": Value::Object(transcription) },
+    })
+}
+
+/// Pull the transcript out of a Vertex `generateContent` response.
+///
+/// With speaker labels on, the model returns one part per speaker turn, so the
+/// text parts are joined the same way the Interactions steps are.
+fn extract_vertex_transcript(body: &str) -> Result<String> {
+    let value: Value = serde_json::from_str(body)
+        .map_err(|e| anyhow!("Could not parse Gemini response: {} (body: {})", e, truncate(body)))?;
+
+    let parts = value
+        .pointer("/candidates/0/content/parts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let joined = parts
+        .iter()
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    Ok(joined)
 }
 
 /// Pull the handle out of an upload response.
@@ -540,7 +758,11 @@ mod tests {
 
     #[test]
     fn an_uploaded_reference_is_sent_as_uri_not_as_data() {
-        let engine = GeminiTranscriber::new("k".into(), MODEL_ID.into()).expect("engine");
+        let engine = GeminiTranscriber::new(
+            GeminiRoute::AiStudio { api_key: "k".into() },
+            MODEL_ID.into(),
+        )
+        .expect("engine");
         let body = engine.build_request(
             &AudioRef::Uploaded(UploadedFile {
                 uri: "https://x/v1beta/files/abc".into(),
@@ -661,6 +883,84 @@ mod tests {
     fn api_error_message_is_surfaced() {
         let body = r#"{"error":{"code":400,"message":"Invalid custom_vocabulary"}}"#;
         assert_eq!(describe_api_error(body), "Invalid custom_vocabulary");
+    }
+
+    #[test]
+    fn vertex_request_spells_the_config_the_way_vertex_wants_it() {
+        let mut cfg = config();
+        cfg.mode = GeminiTranscribeMode::Verbatim;
+        cfg.language_codes = vec!["ru-RU".into(), "en-US".into()];
+        cfg.custom_vocabulary = vec!["Handy".into()];
+        cfg.diarization = true;
+        cfg.timestamps = true;
+
+        let body = build_vertex_request("QUJD", &cfg, "auto", &[]);
+        let atc = &body["generationConfig"]["audioTranscriptionConfig"];
+        assert_eq!(atc["mode"], json!("VERBATIM"));
+        assert_eq!(atc["languageCodes"], json!(["ru-RU", "en-US"]));
+        assert_eq!(atc["customVocabulary"], json!(["Handy"]));
+        assert_eq!(atc["diarization"], json!(true));
+        assert_eq!(atc["wordTimestamp"], json!(true));
+
+        let audio = &body["contents"][0]["parts"][0]["inlineData"];
+        assert_eq!(audio["mimeType"], json!(WAV_MIME));
+        assert_eq!(audio["data"], json!("QUJD"));
+    }
+
+    #[test]
+    fn vertex_smart_mode_drops_verbatim_only_options() {
+        let mut cfg = config();
+        cfg.mode = GeminiTranscribeMode::Smart;
+        cfg.diarization = true;
+        cfg.timestamps = true;
+
+        let atc = build_vertex_request("", &cfg, "auto", &[])["generationConfig"]
+            ["audioTranscriptionConfig"]
+            .clone();
+        assert_eq!(atc["mode"], json!("SMART"));
+        assert!(atc.get("diarization").is_none());
+        assert!(atc.get("wordTimestamp").is_none());
+    }
+
+    #[test]
+    fn vertex_transcript_joins_speaker_parts() {
+        let body = r#"{"candidates":[{"content":{"role":"model","parts":[
+            {"text":"Привет.","audioTranscription":{"speakerLabel":"spk:0"}},
+            {"text":" Hello. "}
+        ]}}]}"#;
+        assert_eq!(extract_vertex_transcript(body).unwrap(), "Привет. Hello.");
+    }
+
+    #[test]
+    fn vertex_transcript_of_silence_is_empty_not_an_error() {
+        let body = r#"{"candidates":[{"content":{"role":"model","parts":[]}}]}"#;
+        assert_eq!(extract_vertex_transcript(body).unwrap(), "");
+    }
+
+    #[test]
+    fn vertex_model_path_targets_the_global_location() {
+        assert_eq!(
+            vertex_model_path("p-1", "gemini-3.5-transcribe"),
+            "projects/p-1/locations/global/publishers/google/models/gemini-3.5-transcribe"
+        );
+    }
+
+    #[test]
+    fn ai_studio_route_without_a_key_names_both_fixes() {
+        std::env::remove_var(API_KEY_ENV);
+        let error = GeminiRoute::from_settings(&config(), "").err().unwrap().to_string();
+        assert!(error.contains("API key") && error.contains("Vertex"), "{error}");
+    }
+
+    #[test]
+    fn vertex_route_without_a_project_says_so() {
+        let mut cfg = config();
+        cfg.connection = GeminiConnection::Vertex;
+        let error = GeminiRoute::from_settings(&cfg, "AIza-ignored")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("project"), "{error}");
     }
 
     #[test]

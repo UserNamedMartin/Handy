@@ -379,6 +379,25 @@ pub enum GeminiTranscribeMode {
     Verbatim,
 }
 
+/// Which Google service the Gemini models are reached through.
+///
+/// The same two models (batch and Live) are served by both, with the same
+/// transcription knobs; what differs is who is billed and how the request is
+/// authenticated. Neither replaces the other — they are two ways to pay for
+/// the same thing, and switching is a settings change, not a model change.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Type, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GeminiConnection {
+    /// Google AI Studio (the Gemini Developer API): an `AIza…` API key, billed
+    /// to that key's AI Studio project — free tier or its own prepaid balance.
+    #[default]
+    AiStudio,
+    /// Google Cloud Vertex AI: OAuth credentials, billed to a Cloud project's
+    /// billing account. The route that Google Cloud credits pay for (the $300
+    /// free trial included); an AI Studio key never draws on them.
+    Vertex,
+}
+
 /// Settings that belong to the Gemini cloud model specifically.
 ///
 /// Kept as its own struct (rather than more flat `AppSettings` fields) so the
@@ -406,6 +425,15 @@ pub struct GeminiTranscribeSettings {
     /// Emit word-level timestamps. Forces `Verbatim`, and Google warns it
     /// "degrades transcription accuracy".
     pub timestamps: bool,
+    /// AI Studio key or Vertex AI. The key itself stays in `cloud_api_keys`.
+    pub connection: GeminiConnection,
+    /// Vertex only: the Cloud project that is billed (its ID, not its name).
+    pub vertex_project: String,
+    /// Vertex only: path to an OAuth credentials file of type
+    /// `authorized_user` — what `gcloud auth application-default login`
+    /// writes. A path, not the secret itself, so the refresh token never
+    /// lands in `settings_store.json`. `~` is expanded.
+    pub vertex_credentials: String,
 }
 
 impl Default for GeminiTranscribeSettings {
@@ -417,6 +445,9 @@ impl Default for GeminiTranscribeSettings {
             include_custom_words: true,
             diarization: false,
             timestamps: false,
+            connection: GeminiConnection::AiStudio,
+            vertex_project: String::new(),
+            vertex_credentials: String::new(),
         }
     }
 }

@@ -8,6 +8,7 @@ import {
   type UsageSummary,
   type WordCount,
 } from "@/bindings";
+import { Segmented } from "../../ui/Segmented";
 import { SettingsGroup } from "../../ui/SettingsGroup";
 
 /** Day windows offered by the activity chart. */
@@ -53,47 +54,6 @@ const modelLabel = (id: string): string => id.split("/").pop() || id;
 /** Sub-cent spend still deserves a number rather than a bare "$0.00". */
 const formatCost = (usd: number): string =>
   usd === 0 ? "$0" : usd < 0.01 ? "<$0.01" : `$${usd.toFixed(2)}`;
-
-/**
- * One choice out of a few, as a pill track with the chosen option filled.
- * Shared by every toggle on this screen so they read as one control.
- */
-function Segmented<T extends string | number>({
-  options,
-  value,
-  onChange,
-  label,
-}: {
-  options: readonly T[];
-  value: T;
-  onChange: (option: T) => void;
-  label: (option: T) => string;
-}) {
-  return (
-    <div className="inline-flex shrink-0 items-center gap-0.5 rounded-md bg-mid-gray/15 p-0.5">
-      {options.map((option) => {
-        const selected = option === value;
-        return (
-          <button
-            key={String(option)}
-            type="button"
-            aria-pressed={selected}
-            onClick={() => onChange(option)}
-            className={`h-6 min-w-[2.75rem] rounded px-2 text-xs leading-none transition-colors cursor-pointer ${
-              selected
-                ? // The brand pink is light in both themes; dark text keeps the
-                  // chosen label readable on it.
-                  "bg-logo-primary font-medium text-neutral-900"
-                : "text-text/55 hover:bg-mid-gray/20 hover:text-text"
-            }`}
-          >
-            {label(option)}
-          </button>
-        );
-      })}
-    </div>
-  );
-}
 
 const Stat: React.FC<{ label: string; value: string; hint?: string }> = ({
   label,

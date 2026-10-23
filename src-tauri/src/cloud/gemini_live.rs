@@ -22,6 +22,12 @@
 //! returns what it has, and an empty result makes the caller batch-transcribe
 //! the same audio rather than lose it.
 //!
+//! Vertex AI speaks the identical protocol (verified: same setup, same
+//! `activityStart`/`activityEnd` bracketing, same `inputTranscription` frames);
+//! only the endpoint, the authentication and the model's resource name differ.
+//! [`GeminiRoute`] carries that difference, so everything below `connect` is
+//! shared by both.
+//!
 //! Docs: <https://ai.google.dev/gemini-api/docs/live-api/live-transcribe>
 
 use anyhow::{anyhow, Result};
@@ -32,16 +38,26 @@ use serde_json::{json, Value};
 use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 use tokio::sync::mpsc as tokio_mpsc;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::handshake::client::Request;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
 
+use super::gemini::{vertex_model_path, GeminiRoute, VERTEX_HOST};
 use crate::settings::{GeminiTranscribeMode, GeminiTranscribeSettings};
 
 const WS_URL: &str =
     "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
 
+/// Vertex's Live endpoint path, appended to [`VERTEX_HOST`].
+const VERTEX_WS_PATH: &str = "/ws/google.cloud.aiplatform.v1.LlmBidiService/BidiGenerateContent";
+
 /// API model name for the streaming variant. Distinct from the batch model, and
 /// the Live API wants it `models/`-prefixed.
 pub const LIVE_API_MODEL: &str = "models/gemini-3.5-transcribe-live";
+
+/// The same model without the prefix, for building a Vertex resource name.
+const LIVE_MODEL_NAME: &str = "gemini-3.5-transcribe-live";
 
 /// Catalog id of the streaming model in Handy's model list.
 pub const LIVE_MODEL_ID: &str = "gemini-3.5-transcribe-live";
@@ -138,13 +154,13 @@ impl GeminiLiveSession {
     /// *recording starts* rather than at key-release: the handshake overlaps the
     /// user's first words and costs nothing perceptible.
     pub fn connect(
-        api_key: &str,
+        route: &GeminiRoute,
         config: &GeminiTranscribeSettings,
         language: &str,
         custom_words: &[String],
     ) -> Result<Self> {
-        let url = format!("{}?key={}", WS_URL, api_key);
-        let setup = build_setup(config, language, custom_words);
+        let (request, model) = live_endpoint(route)?;
+        let setup = build_setup(&model, config, language, custom_words);
 
         let (audio_tx, audio_rx) = tokio_mpsc::unbounded_channel::<Outbound>();
         let (event_tx, event_rx) = std_mpsc::channel::<LiveEvent>();
@@ -163,7 +179,7 @@ impl GeminiLiveSession {
                         return;
                     }
                 };
-                runtime.block_on(session(url, setup, audio_rx, event_tx, ready_tx));
+                runtime.block_on(session(request, setup, audio_rx, event_tx, ready_tx));
             })
             .map_err(|e| anyhow!("failed to spawn Gemini Live thread: {}", e))?;
 
@@ -273,7 +289,48 @@ pub fn join_finals(chunks: &[String]) -> String {
         .join(" ")
 }
 
+/// The handshake request and the `setup.model` value for a route.
+///
+/// AI Studio authenticates with the key in the query string and names the
+/// model `models/…`; Vertex wants a bearer token in a header and the model's
+/// full resource name under the project being billed.
+fn live_endpoint(route: &GeminiRoute) -> Result<(Request, String)> {
+    match route {
+        GeminiRoute::AiStudio { api_key } => {
+            let request = format!("{}?key={}", WS_URL, api_key)
+                .into_client_request()
+                .map_err(|e| anyhow!("Gemini Live: bad endpoint: {}", e))?;
+            Ok((request, LIVE_API_MODEL.to_string()))
+        }
+        GeminiRoute::Vertex {
+            project,
+            credentials,
+        } => {
+            // Minted before the socket opens: a token refresh is a network
+            // round trip, and this runs while the user has already started
+            // talking — the same window the handshake itself uses.
+            let token = credentials.access_token()?;
+            let mut request = format!("wss://{}{}", VERTEX_HOST, VERTEX_WS_PATH)
+                .into_client_request()
+                .map_err(|e| anyhow!("Gemini Live: bad endpoint: {}", e))?;
+            let headers = request.headers_mut();
+            headers.insert(
+                "Authorization",
+                HeaderValue::from_str(&format!("Bearer {}", token))
+                    .map_err(|e| anyhow!("Gemini Live: unusable access token: {}", e))?,
+            );
+            headers.insert(
+                "x-goog-user-project",
+                HeaderValue::from_str(project)
+                    .map_err(|e| anyhow!("Gemini Live: unusable project id: {}", e))?,
+            );
+            Ok((request, vertex_model_path(project, LIVE_MODEL_NAME)))
+        }
+    }
+}
+
 fn build_setup(
+    model: &str,
     config: &GeminiTranscribeSettings,
     language: &str,
     custom_words: &[String],
@@ -302,7 +359,7 @@ fn build_setup(
 
     json!({
         "setup": {
-            "model": LIVE_API_MODEL,
+            "model": model,
             "generationConfig": { "responseModalities": ["TEXT"] },
             "inputAudioTranscription": Value::Object(transcription),
             // The push-to-talk key owns the turn boundaries, so server-side
@@ -317,13 +374,13 @@ fn build_setup(
 }
 
 async fn session(
-    url: String,
+    request: Request,
     setup: Value,
     mut audio_rx: tokio_mpsc::UnboundedReceiver<Outbound>,
     event_tx: std_mpsc::Sender<LiveEvent>,
     ready_tx: std_mpsc::Sender<Result<()>>,
 ) {
-    let (stream, _) = match tokio_tungstenite::connect_async(&url).await {
+    let (stream, _) = match tokio_tungstenite::connect_async(request).await {
         Ok(pair) => pair,
         Err(e) => {
             let _ = ready_tx.send(Err(anyhow!("Gemini Live connection failed: {}", e)));
@@ -340,6 +397,21 @@ async fn session(
     // The server acknowledges the config before accepting audio. Anything else
     // here is a rejected setup (bad key, unknown field) and must surface now.
     match reader.next().await {
+        // A refused session (exhausted balance, bad key, unknown model) is a
+        // close frame whose reason is the only explanation the service gives.
+        // Parsing that empty frame as JSON is what used to log
+        // "EOF while parsing a value" while the real cause — a 402 — was lost.
+        Some(Ok(Message::Close(frame))) => {
+            let reason = match frame {
+                Some(f) => format!("code {}: {}", f.code, f.reason),
+                None => "no reason given".to_string(),
+            };
+            let _ = ready_tx.send(Err(anyhow!(
+                "Gemini Live refused the session ({})",
+                reason
+            )));
+            return;
+        }
         Some(Ok(msg)) => {
             let text = message_text(&msg);
             match serde_json::from_str::<Value>(&text) {
@@ -617,7 +689,7 @@ mod tests {
     fn setup_uses_the_live_model_and_enum_mode() {
         let mut cfg = GeminiTranscribeSettings::default();
         cfg.mode = GeminiTranscribeMode::Smart;
-        let setup = build_setup(&cfg, "auto", &[]);
+        let setup = build_setup(LIVE_API_MODEL, &cfg, "auto", &[]);
         let inner = &setup["setup"];
         assert_eq!(inner["model"], json!(LIVE_API_MODEL));
         assert_eq!(inner["generationConfig"]["responseModalities"], json!(["TEXT"]));
@@ -633,11 +705,33 @@ mod tests {
         cfg.language_codes = vec!["ru-RU".into(), "en-US".into()];
         cfg.custom_vocabulary = vec!["10Clouds".into()];
         cfg.include_custom_words = true;
-        let setup = build_setup(&cfg, "auto", &["Handy".to_string()]);
+        let setup = build_setup(LIVE_API_MODEL, &cfg, "auto", &["Handy".to_string()]);
         let iat = &setup["setup"]["inputAudioTranscription"];
         assert_eq!(iat["mode"], json!("VERBATIM"));
         assert_eq!(iat["languageCodes"], json!(["ru-RU", "en-US"]));
         assert_eq!(iat["customVocabulary"], json!(["10Clouds", "Handy"]));
+    }
+
+    #[test]
+    fn ai_studio_endpoint_carries_the_key_and_the_prefixed_model() {
+        let route = GeminiRoute::AiStudio {
+            api_key: "AIza-test".into(),
+        };
+        let (request, model) = live_endpoint(&route).unwrap();
+        assert_eq!(request.uri().host(), Some("generativelanguage.googleapis.com"));
+        assert_eq!(request.uri().query(), Some("key=AIza-test"));
+        assert!(request.headers().get("Authorization").is_none());
+        assert_eq!(model, LIVE_API_MODEL);
+    }
+
+    #[test]
+    fn vertex_setup_names_the_model_under_the_billed_project() {
+        let model = vertex_model_path("p-1", LIVE_MODEL_NAME);
+        let setup = build_setup(&model, &GeminiTranscribeSettings::default(), "auto", &[]);
+        assert_eq!(
+            setup["setup"]["model"],
+            json!("projects/p-1/locations/global/publishers/google/models/gemini-3.5-transcribe-live")
+        );
     }
 
     #[test]
@@ -682,5 +776,84 @@ mod tests {
         assert!(!handle_server_message("not json", &tx, true));
         assert!(!handle_server_message(r#"{"serverContent":{}}"#, &tx, true));
         assert!(rx.try_iter().next().is_none());
+    }
+}
+
+/// End-to-end check against the real service, through the same code the app
+/// runs. Ignored by default (network, credentials, a bill); run it with
+///
+/// ```sh
+/// HANDY_SMOKE_WAV=… HANDY_SMOKE_VERTEX_PROJECT=… HANDY_SMOKE_VERTEX_CREDENTIALS=… \
+///   cargo test --lib live_smoke -- --ignored --nocapture
+/// ```
+///
+/// Without the Vertex variables it takes the AI Studio route with
+/// `HANDY_GEMINI_API_KEY`. Audio is fed at 4x real time: faster than that and
+/// the service closes the socket with "Client overran StreamHandler internal
+/// queue size".
+#[cfg(test)]
+mod live_smoke {
+    use super::*;
+    use crate::cloud::gemini::{GeminiTranscriber, MODEL_ID};
+    use crate::settings::GeminiConnection;
+
+    fn smoke_config() -> Option<(GeminiTranscribeSettings, Vec<f32>)> {
+        let wav_path = std::env::var("HANDY_SMOKE_WAV").ok()?;
+        let mut reader = hound::WavReader::open(wav_path).expect("open wav");
+        let samples: Vec<f32> = reader
+            .samples::<i16>()
+            .map(|s| s.expect("sample") as f32 / i16::MAX as f32)
+            .collect();
+        let mut config = GeminiTranscribeSettings::default();
+        config.mode = GeminiTranscribeMode::Verbatim;
+        if let Ok(project) = std::env::var("HANDY_SMOKE_VERTEX_PROJECT") {
+            config.connection = GeminiConnection::Vertex;
+            config.vertex_project = project;
+            config.vertex_credentials =
+                std::env::var("HANDY_SMOKE_VERTEX_CREDENTIALS").expect("credentials path");
+        }
+        Some((config, samples))
+    }
+
+    #[test]
+    #[ignore]
+    fn batch_and_live_transcribe_a_real_recording() {
+        let Some((config, samples)) = smoke_config() else {
+            eprintln!("HANDY_SMOKE_WAV not set; skipping");
+            return;
+        };
+        let route = GeminiRoute::from_settings(&config, "").expect("route");
+        eprintln!("route: {}", route.label());
+
+        let started = std::time::Instant::now();
+        let batch = GeminiTranscriber::new(route.clone(), MODEL_ID.into())
+            .expect("engine")
+            .transcribe(&samples, &config, "auto", &[])
+            .expect("batch transcript");
+        eprintln!("batch ({:?}): {}", started.elapsed(), batch);
+        assert!(!batch.is_empty());
+
+        let mut session =
+            GeminiLiveSession::connect(&route, &config, "auto", &[]).expect("live connect");
+        let mut finals = Vec::new();
+        for chunk in samples.chunks(1600) {
+            session.feed(chunk);
+            std::thread::sleep(Duration::from_millis(25));
+            for event in session.poll() {
+                if let LiveEvent::Final(text) = event {
+                    finals.push(text);
+                }
+            }
+        }
+        let audio = Duration::from_secs_f64(samples.len() as f64 / SAMPLE_RATE as f64);
+        let released = std::time::Instant::now();
+        finals.extend(
+            session
+                .finish(Duration::from_secs(15), tail_first_wait(audio))
+                .expect("live tail"),
+        );
+        let live = join_finals(&finals);
+        eprintln!("live (tail {:?}): {}", released.elapsed(), live);
+        assert!(!live.is_empty());
     }
 }

@@ -1178,6 +1178,26 @@ export type GeminiTranscribeMode =
  */
 "verbatim"
 /**
+ * Which Google service the Gemini models are reached through.
+ * 
+ * The same two models (batch and Live) are served by both, with the same
+ * transcription knobs; what differs is who is billed and how the request is
+ * authenticated. Neither replaces the other — they are two ways to pay for
+ * the same thing, and switching is a settings change, not a model change.
+ */
+export type GeminiConnection = 
+/**
+ * Google AI Studio (the Gemini Developer API): an `AIza…` API key, billed
+ * to that key's AI Studio project — free tier or its own prepaid balance.
+ */
+"ai_studio" | 
+/**
+ * Google Cloud Vertex AI: OAuth credentials, billed to a Cloud project's
+ * billing account. The route that Google Cloud credits pay for (the $300
+ * free trial included); an AI Studio key never draws on them.
+ */
+"vertex"
+/**
  * Settings that belong to the Gemini cloud model specifically.
  * 
  * Kept as its own struct (rather than more flat `AppSettings` fields) so the
@@ -1212,7 +1232,22 @@ diarization: boolean;
  * Emit word-level timestamps. Forces `Verbatim`, and Google warns it
  * "degrades transcription accuracy".
  */
-timestamps: boolean }
+timestamps: boolean; 
+/**
+ * AI Studio key or Vertex AI. The key itself stays in `cloud_api_keys`.
+ */
+connection: GeminiConnection; 
+/**
+ * Vertex only: the Cloud project that is billed (its ID, not its name).
+ */
+vertex_project: string; 
+/**
+ * Vertex only: path to an OAuth credentials file of type
+ * `authorized_user` — what `gcloud auth application-default login`
+ * writes. A path, not the secret itself, so the refresh token never
+ * lands in `settings_store.json`. `~` is expanded.
+ */
+vertex_credentials: string }
 export type GpuDeviceOption = { id: string; name: string; total_vram_mb: number }
 export type HistoryEntry = { id: number; file_name: string; timestamp: number; saved: boolean; title: string; transcription_text: string; post_processed_text: string | null; post_process_prompt: string | null; post_process_requested: boolean }
 export type HistoryUpdatePayload = { action: "added"; entry: HistoryEntry } | { action: "updated"; entry: HistoryEntry } | { action: "deleted"; id: number } | { action: "toggled"; id: number }

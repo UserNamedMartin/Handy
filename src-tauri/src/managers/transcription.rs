@@ -804,24 +804,23 @@ impl TranscriptionManager {
             }
             EngineType::Gemini => {
                 // "Loading" is just wiring up credentials — no bytes, no
-                // warm-up. The one failure mode is a missing API key, which we
-                // surface here rather than at the end of the user's first
-                // dictation.
+                // warm-up. The failure modes are missing credentials for the
+                // chosen connection (an AI Studio key, or a Vertex project and
+                // credentials file), surfaced here rather than at the end of
+                // the user's first dictation.
                 let settings = get_settings(&self.app_handle);
-                let api_key = settings
-                    .cloud_api_keys
-                    .get(crate::cloud::gemini::PROVIDER_ID)
-                    .cloned()
-                    .unwrap_or_default();
-
-                let engine = GeminiTranscriber::new(
-                    api_key,
-                    crate::cloud::gemini::API_MODEL.to_string(),
-                )
-                .map_err(|e| {
-                    emit_loading_failed(&e.to_string());
-                    e
-                })?;
+                let engine = gemini_route(&settings)
+                    .and_then(|route| {
+                        info!("Gemini: connecting through {}", route.label());
+                        GeminiTranscriber::new(
+                            route,
+                            crate::cloud::gemini::API_MODEL.to_string(),
+                        )
+                    })
+                    .map_err(|e| {
+                        emit_loading_failed(&e.to_string());
+                        e
+                    })?;
                 LoadedEngine::Gemini(engine)
             }
             EngineType::ElevenLabs => {
@@ -1555,24 +1554,20 @@ impl TranscriptionManager {
         model_id: &str,
     ) {
         let settings = get_settings(&self.app_handle);
-        let api_key = crate::cloud::gemini::resolve_api_key(
-            settings
-                .cloud_api_keys
-                .get(crate::cloud::gemini::PROVIDER_ID)
-                .map(String::as_str)
-                .unwrap_or_default(),
-        );
         let language =
             effective_language_for_model(&settings, self.model_manager.as_ref(), model_id);
 
         // Connecting costs ~700 ms, paid here — while the user is already
         // speaking — so it never shows up in the post-release wait.
-        let mut session = match GeminiLiveSession::connect(
-            &api_key,
-            &settings.gemini_transcribe,
-            &language,
-            &settings.custom_words,
-        ) {
+        let connected = gemini_route(&settings).and_then(|route| {
+            GeminiLiveSession::connect(
+                &route,
+                &settings.gemini_transcribe,
+                &language,
+                &settings.custom_words,
+            )
+        });
+        let mut session = match connected {
             Ok(session) => session,
             Err(e) => {
                 warn!(
@@ -2250,6 +2245,20 @@ impl StreamPerf {
     fn compute_secs(&self) -> f64 {
         self.stream_compute_elapsed.as_secs_f64()
     }
+}
+
+/// The Gemini connection the settings currently ask for — AI Studio key or
+/// Vertex AI — built fresh each time so a settings change applies to the very
+/// next dictation without reloading the engine.
+fn gemini_route(settings: &AppSettings) -> Result<crate::cloud::gemini::GeminiRoute> {
+    crate::cloud::gemini::GeminiRoute::from_settings(
+        &settings.gemini_transcribe,
+        settings
+            .cloud_api_keys
+            .get(crate::cloud::gemini::PROVIDER_ID)
+            .map(String::as_str)
+            .unwrap_or_default(),
+    )
 }
 
 fn real_time_factor(audio_secs: f64, compute_secs: f64) -> f64 {
