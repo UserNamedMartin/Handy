@@ -286,7 +286,6 @@ impl GeminiTranscriber {
         language: &str,
         custom_words: &[String],
     ) -> Result<String> {
-        let token = credentials.access_token()?;
         let encoded = base64::engine::general_purpose::STANDARD.encode(wav);
         debug!(
             "Gemini transcribe: model={}, audio={:.1}s, route=Vertex AI ({}), inline {} KB",
@@ -302,16 +301,31 @@ impl GeminiTranscriber {
             VERTEX_HOST,
             vertex_model_path(project, &self.model)
         );
-        let request = self
-            .client
-            .post(url)
-            .bearer_auth(token)
-            // Bill quota to the same project the URL names; user credentials
-            // otherwise fall back to gcloud's own shared client project.
-            .header("x-goog-user-project", project)
-            .json(&body);
+        let send = |token: String| {
+            let request = self
+                .client
+                .post(&url)
+                .bearer_auth(token)
+                // Bill quota to the same project the URL names; user credentials
+                // otherwise fall back to gcloud's own shared client project.
+                .header("x-goog-user-project", project)
+                .json(&body);
+            send_for_text(request)
+        };
 
-        extract_vertex_transcript(&send_for_text(request)?)
+        // One retry on 401 with a freshly minted token: the cached one can be
+        // dead before its stated expiry (revoked, or held across a sleep), and
+        // the dictation is worth one more round trip.
+        let response = match send(credentials.access_token()?) {
+            Err(e) if e.to_string().contains("401") => {
+                warn!("Gemini (Vertex): token rejected, refreshing and retrying once: {}", e);
+                credentials.invalidate();
+                send(credentials.access_token()?)
+            }
+            other => other,
+        };
+
+        extract_vertex_transcript(&response?)
     }
 
     /// Hand the WAV to the Files API and return the handle to reference it by.

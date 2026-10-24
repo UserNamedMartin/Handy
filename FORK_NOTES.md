@@ -423,6 +423,22 @@ the AI Studio prepaid balance ran dry mid-day and every dictation came back 402.
   message: they would need RS256 signing for a credential this fork does not use.
   Every request also sends `x-goog-user-project`, so quota is charged to the
   project the URL names rather than gcloud's shared client project.
+- **The login does not last on a Workspace account.** `cone.red` has Google
+  Cloud session control on, so the refresh token in the credentials file dies
+  after the session length (16 h by default) with `invalid_grant` /
+  `invalid_rapt`, and every dictation fails until `gcloud auth
+  application-default login` is run again (`CLOUDSDK_CONFIG=~/.config/gcp-gemini/gcloud`).
+  Found on day two. No client-side way round it: service-account keys and
+  SA-bound API keys are both blocked by org policy
+  (`iam.disableServiceAccountKeyCreation`,
+  `iam.managed.disableServiceAccountApiKeyCreation`). The real fix is a
+  Workspace admin setting *Security → Access and data control → Google Cloud
+  session control* to "Never require reauthentication" (or exempting trusted
+  apps). The error message now names this case.
+- **Token expiry is wall-clock.** The cached access token's expiry was an
+  `Instant`, which on macOS stops during sleep, so after a long lid-close a dead
+  token looked fresh and the first dictation came back 401. Now `SystemTime`,
+  and a Vertex batch request that gets 401 drops the cache and retries once.
 - A Live session refused at setup now logs the server's close reason
   (`Gemini Live refused the session (code …: …)`). It used to parse the empty
   close frame as JSON and log `EOF while parsing a value`, which hid the 402.

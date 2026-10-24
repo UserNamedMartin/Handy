@@ -17,7 +17,7 @@ use once_cell::sync::Lazy;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 
@@ -62,7 +62,10 @@ pub struct VertexCredentials {
     client_secret: String,
     refresh_token: String,
     http: reqwest::Client,
-    cached: Mutex<Option<(String, Instant)>>,
+    /// Expiry in wall-clock time, not `Instant`: on macOS `Instant` stops while
+    /// the machine sleeps, so a token cached before a long lid-close still
+    /// looked fresh afterwards and the first dictation came back 401.
+    cached: Mutex<Option<(String, SystemTime)>>,
 }
 
 impl VertexCredentials {
@@ -125,11 +128,18 @@ impl VertexCredentials {
         Ok(credentials)
     }
 
+    /// Drop the cached access token so the next call mints a fresh one. For a
+    /// request the service answered 401: the token was revoked or the clock
+    /// lied, and either way the cached copy is no longer worth trusting.
+    pub fn invalidate(&self) {
+        *self.cached.lock().unwrap() = None;
+    }
+
     /// A valid access token, refreshed when the cached one is about to expire.
     /// Synchronous; safe to call from any thread (see [`super::block_on`]).
     pub fn access_token(&self) -> Result<String> {
         if let Some((token, valid_until)) = self.cached.lock().unwrap().as_ref() {
-            if Instant::now() < *valid_until {
+            if SystemTime::now() < *valid_until {
                 return Ok(token.clone());
             }
         }
@@ -154,10 +164,21 @@ impl VertexCredentials {
             if !status.is_success() {
                 // `invalid_grant` here means the refresh token was revoked or
                 // expired — the fix is a fresh login, so say which file.
+                // `invalid_rapt` is the common case on a Workspace account: the
+                // domain's "Google Cloud session control" ends every gcloud
+                // login after a fixed session length (16 h by default), and
+                // only a Workspace admin can lengthen or remove it.
+                let hint = if text.contains("invalid_rapt") {
+                    " — the Workspace session for Google Cloud has expired; run \
+                     `gcloud auth application-default login` again"
+                } else {
+                    ""
+                };
                 return Err(anyhow!(
-                    "Google refused the Vertex credentials in {} ({}): {}",
+                    "Google refused the Vertex credentials in {} ({}){}: {}",
                     path.display(),
                     status,
+                    hint,
                     text
                 ));
             }
@@ -167,7 +188,7 @@ impl VertexCredentials {
 
         let lifetime = Duration::from_secs(response.expires_in).saturating_sub(EXPIRY_MARGIN);
         *self.cached.lock().unwrap() =
-            Some((response.access_token.clone(), Instant::now() + lifetime));
+            Some((response.access_token.clone(), SystemTime::now() + lifetime));
         Ok(response.access_token)
     }
 }
