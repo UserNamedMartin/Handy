@@ -729,13 +729,19 @@ curl -fsSL -o src-tauri/resources/models/silero_vad_v4.onnx https://blob.handy.c
 
 ```bash
 export CMAKE_POLICY_VERSION_MINIMUM=3.5
-bun run tauri build          # release .app + .dmg  → src-tauri/target/release/bundle/macos/Handy.app
+bun run tauri build --bundles app -- --profile local   # local install: .app only → src-tauri/target/local/bundle/macos/Handy.app
+# bun run tauri build        # full release (fat LTO + .dmg) → target/release/… — only for a distributable build
 # bun run tauri dev          # debug run; ALSO regenerates src/bindings.ts (tauri-specta)
 (cd src-tauri && cargo check)  # fast Rust type-check before a full build (~seconds incremental)
 (cd src-tauri && cargo test)   # unit tests — run after coordinator/settings changes
 ```
 - **Run `cargo test` (in `src-tauri/`) after touching the coordinator or settings** — the fork adds unit tests for the Hybrid state machine (hold / double-tap-latch / lone-tap) and settings back-fill/salvage; keep them green.
 - **First build is slow** (~10–25 min: whisper.cpp + onnxruntime + all Rust deps). Incremental rebuilds are ~30 s–2 min.
+- **Use the `local` profile for installs on this Mac.** `[profile.local]` in
+  `Cargo.toml` is release with thin LTO and 16 codegen units instead of fat LTO
+  and one; the release profile's single-threaded final optimisation was most of
+  a ~10 min build on the M1 Pro. `--bundles app` skips the .dmg. First `local`
+  build (cold target dir): 4 min.
 - A harmless error at the very end — `A public key has been found, but no private key ... TAURI_SIGNING_PRIVATE_KEY` — is the auto-updater artifact signing. The `.app` is already built before it. Ignore, or disable the updater in `tauri.conf.json`.
 - `src/bindings.ts` is auto-generated and only re-exported on **debug** builds. Release builds don't regenerate it — fine unless the frontend needs new Rust types.
 
@@ -750,7 +756,7 @@ osascript -e 'tell application "Handy" to quit'; pkill -f "Handy.app/Contents/Ma
 brew uninstall --cask handy 2>/dev/null || true
 # 3. install
 rm -rf /Applications/Handy.app
-cp -R src-tauri/target/release/bundle/macos/Handy.app /Applications/
+cp -R src-tauri/target/local/bundle/macos/Handy.app /Applications/   # or target/release/… for a full release build
 # 4. RE-SIGN with the stable local cert — REQUIRED every rebuild to keep TCC grants
 #    Unlock the signing keychain FIRST, or codesign pops a blocking GUI password
 #    prompt (and a headless/timed shell just hangs on it). The partition-list line
