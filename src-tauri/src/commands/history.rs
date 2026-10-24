@@ -116,7 +116,13 @@ pub async fn retry_history_entry_transcription(
         }
     }
 
-    let transcription = transcription.map_err(|e| e.to_string())?;
+    // The history screen shows only a generic toast and puts the real error in
+    // the WebView console, which nobody has open — so the log is the only place
+    // a failed retry can be diagnosed from.
+    let transcription = transcription.map_err(|e| {
+        log::error!("Re-transcription of history entry {} failed: {}", id, e);
+        e.to_string()
+    })?;
 
     if transcription.is_empty() {
         return Err("Recording contains no speech".to_string());

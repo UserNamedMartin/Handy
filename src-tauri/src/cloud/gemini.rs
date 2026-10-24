@@ -165,16 +165,19 @@ enum AudioRef {
     Uploaded(UploadedFile),
 }
 
-/// A cloud "engine". Holds no model — just the HTTP client and the route and
-/// model id it was configured with.
+/// A cloud "engine". Holds no model — just the HTTP client and the model id.
+///
+/// Deliberately not the route: credentials are resolved per request, the way
+/// the Live worker already does. An engine that captured them at load time kept
+/// using a dead login after a fresh `gcloud` sign-in, so every history retry
+/// failed while live dictation — which re-resolves each time — worked.
 pub struct GeminiTranscriber {
     client: reqwest::Client,
-    route: GeminiRoute,
     model: String,
 }
 
 impl GeminiTranscriber {
-    pub fn new(route: GeminiRoute, model: String) -> Result<Self> {
+    pub fn new(model: String) -> Result<Self> {
         let client = reqwest::Client::builder()
             // Generous relative to the sub-second median, but bounded: a hung
             // request must not leave the user staring at the overlay.
@@ -182,18 +185,15 @@ impl GeminiTranscriber {
             .build()
             .map_err(|e| anyhow!("Failed to build HTTP client for Gemini: {}", e))?;
 
-        Ok(Self {
-            client,
-            route,
-            model,
-        })
+        Ok(Self { client, model })
     }
 
-    /// Transcribe one utterance. `language` is Handy's already-validated
-    /// language *intent* ("auto" or a code); it is only consulted when the
-    /// settings block carries no explicit `language_codes` of its own.
+    /// Transcribe one utterance through `route`. `language` is Handy's
+    /// already-validated language *intent* ("auto" or a code); it is only
+    /// consulted when the settings block carries no explicit `language_codes`.
     pub fn transcribe(
         &self,
+        route: &GeminiRoute,
         audio: &[f32],
         config: &GeminiTranscribeSettings,
         language: &str,
@@ -204,7 +204,7 @@ impl GeminiTranscriber {
         }
 
         let wav = super::encode_wav_16k(audio)?;
-        match &self.route {
+        match route {
             GeminiRoute::AiStudio { api_key } => {
                 self.transcribe_ai_studio(api_key, &wav, config, language, custom_words)
             }
@@ -772,11 +772,7 @@ mod tests {
 
     #[test]
     fn an_uploaded_reference_is_sent_as_uri_not_as_data() {
-        let engine = GeminiTranscriber::new(
-            GeminiRoute::AiStudio { api_key: "k".into() },
-            MODEL_ID.into(),
-        )
-        .expect("engine");
+        let engine = GeminiTranscriber::new(MODEL_ID.into()).expect("engine");
         let body = engine.build_request(
             &AudioRef::Uploaded(UploadedFile {
                 uri: "https://x/v1beta/files/abc".into(),

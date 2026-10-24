@@ -435,6 +435,13 @@ the AI Studio prepaid balance ran dry mid-day and every dictation came back 402.
   Workspace admin setting *Security → Access and data control → Google Cloud
   session control* to "Never require reauthentication" (or exempting trusted
   apps). The error message now names this case.
+- **Credentials are resolved per request, batch included.** The batch engine
+  first captured its route when the model loaded, so after a fresh `gcloud`
+  login it kept the dead credential: live dictation (which re-resolves every
+  time) worked, while every history retry failed with the generic "Failed to
+  re-transcribe" toast and nothing in the log. `GeminiTranscriber` now holds
+  only the client and model; `transcribe()` takes the route, and a failed retry
+  is logged by `retry_history_entry_transcription`.
 - **Token expiry is wall-clock.** The cached access token's expiry was an
   `Instant`, which on macOS stops during sleep, so after a long lid-close a dead
   token looked fresh and the first dictation came back 401. Now `SystemTime`,

@@ -826,9 +826,9 @@ mod live_smoke {
         eprintln!("route: {}", route.label());
 
         let started = std::time::Instant::now();
-        let batch = GeminiTranscriber::new(route.clone(), MODEL_ID.into())
+        let batch = GeminiTranscriber::new(MODEL_ID.into())
             .expect("engine")
-            .transcribe(&samples, &config, "auto", &[])
+            .transcribe(&route, &samples, &config, "auto", &[])
             .expect("batch transcript");
         eprintln!("batch ({:?}): {}", started.elapsed(), batch);
         assert!(!batch.is_empty());

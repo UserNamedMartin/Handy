@@ -808,14 +808,14 @@ impl TranscriptionManager {
                 // chosen connection (an AI Studio key, or a Vertex project and
                 // credentials file), surfaced here rather than at the end of
                 // the user's first dictation.
+                // The route is checked here only to fail early; each request
+                // resolves it again, so a fresh login or a settings change
+                // applies without reloading the engine.
                 let settings = get_settings(&self.app_handle);
                 let engine = gemini_route(&settings)
                     .and_then(|route| {
                         info!("Gemini: connecting through {}", route.label());
-                        GeminiTranscriber::new(
-                            route,
-                            crate::cloud::gemini::API_MODEL.to_string(),
-                        )
+                        GeminiTranscriber::new(crate::cloud::gemini::API_MODEL.to_string())
                     })
                     .map_err(|e| {
                         emit_loading_failed(&e.to_string());
@@ -2022,12 +2022,14 @@ impl TranscriptionManager {
                             .map(|r| r.text)
                             .map_err(|e| anyhow::anyhow!("Cohere transcription failed: {}", e))
                     }
-                    LoadedEngine::Gemini(gemini_engine) => gemini_engine.transcribe(
+                    LoadedEngine::Gemini(gemini_engine) => gemini_route(&settings).and_then(
+                        |route| gemini_engine.transcribe(
+                        &route,
                         &audio,
                         &settings.gemini_transcribe,
                         &validated_language,
                         &settings.custom_words,
-                    ),
+                    )),
                     LoadedEngine::ElevenLabs(engine) => {
                         engine.transcribe(&audio, &validated_language)
                     }
