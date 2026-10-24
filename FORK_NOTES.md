@@ -423,18 +423,22 @@ the AI Studio prepaid balance ran dry mid-day and every dictation came back 402.
   message: they would need RS256 signing for a credential this fork does not use.
   Every request also sends `x-goog-user-project`, so quota is charged to the
   project the URL names rather than gcloud's shared client project.
-- **The login does not last on a Workspace account.** `cone.red` has Google
-  Cloud session control on, so the refresh token in the credentials file dies
-  after the session length (16 h by default) with `invalid_grant` /
-  `invalid_rapt`, and every dictation fails until `gcloud auth
-  application-default login` is run again (`CLOUDSDK_CONFIG=~/.config/gcp-gemini/gcloud`).
-  Found on day two. No client-side way round it: service-account keys and
-  SA-bound API keys are both blocked by org policy
-  (`iam.disableServiceAccountKeyCreation`,
-  `iam.managed.disableServiceAccountApiKeyCreation`). The real fix is a
-  Workspace admin setting *Security → Access and data control → Google Cloud
-  session control* to "Never require reauthentication" (or exempting trusted
-  apps). The error message now names this case.
+- **The gcloud login does not last on a Workspace account; WIF does.**
+  `cone.red` has Google Cloud session control on, so a gcloud refresh token dies
+  after the session length (about a day) with `invalid_grant` /
+  `invalid_rapt` — on the gcloud CLI client and on the ADC client alike. SA
+  keys (create and upload) and SA-bound API keys are all blocked by org policy,
+  and the org rejects outside principals (`iam.allowedPolicyMemberDomains`), so a
+  personal Gmail cannot be granted access either. What works with only project
+  Owner rights is **Workload Identity Federation with a local signing key**:
+  pool `handy-local`, OIDC provider `martin-mac` whose JWKS is uploaded directly
+  (no public issuer needed), and `principal://…/subject/martin-mac` granted
+  `roles/aiplatform.user`. `~/.config/gcp-gemini/wif/mint-jwt` signs a one-hour
+  JWT with `private.pem` via openssl; `credentials.json` is a standard
+  `external_account` file pointing at it; `google_oauth.rs` runs the command
+  and trades the JWT at `sts.googleapis.com`. No user session anywhere, so
+  nothing expires. IAM grants to the new principal took ~1–3 minutes to start
+  working (403 until then).
 - **Credentials are resolved per request, batch included.** The batch engine
   first captured its route when the model loaded, so after a fresh `gcloud`
   login it kept the dead credential: live dictation (which re-resolves every

@@ -3,14 +3,18 @@
 //! Vertex does not take API keys here: a plain key is refused outright
 //! ("API keys are not supported by this API"), and a key bound to a service
 //! account is blocked by the default organization policy
-//! `iam.managed.disableServiceAccountApiKeyCreation`. What works everywhere is
-//! the file `gcloud auth application-default login` writes — an
-//! `authorized_user` credential holding a long-lived refresh token, which
-//! trades for a one-hour access token at Google's token endpoint.
+//! `iam.managed.disableServiceAccountApiKeyCreation`. Two credential files work:
 //!
-//! Only `authorized_user` is supported. A service-account file would need RS256
-//! JWT signing and a crypto dependency for a credential this fork has no use
-//! for, so it is rejected with a message that says so rather than half-handled.
+//! - **`external_account`** (preferred): Workload Identity Federation. A local
+//!   command prints a JWT signed with a local key; Google's STS trades it for an
+//!   access token. No user login is involved, so nothing expires. This is what
+//!   survives a Workspace domain's Google Cloud session control, which kills a
+//!   gcloud login after about a day (`invalid_rapt`).
+//! - **`authorized_user`**: what `gcloud auth application-default login` writes,
+//!   a refresh token. Fine on a personal account; dies daily on a Workspace one.
+//!
+//! Service-account key files are not supported: the same org policies forbid
+//! creating or uploading SA keys, and they would need RS256 signing in-process.
 
 use anyhow::{anyhow, Result};
 use once_cell::sync::Lazy;
@@ -43,6 +47,51 @@ struct CredentialsFile {
     client_secret: String,
     #[serde(default)]
     refresh_token: String,
+    #[serde(default)]
+    audience: String,
+    #[serde(default)]
+    subject_token_type: String,
+    #[serde(default)]
+    token_url: String,
+    #[serde(default)]
+    credential_source: Option<CredentialSource>,
+}
+
+#[derive(Deserialize)]
+struct CredentialSource {
+    executable: Option<ExecutableSource>,
+}
+
+#[derive(Deserialize)]
+struct ExecutableSource {
+    command: String,
+}
+
+/// What the executable prints (Google's executable-sourced credential format).
+#[derive(Deserialize)]
+struct ExecutableOutput {
+    success: bool,
+    #[serde(default)]
+    id_token: String,
+    #[serde(default)]
+    message: String,
+}
+
+/// How a fresh access token is obtained.
+enum Grant {
+    /// A gcloud user login: trade the refresh token at Google's OAuth endpoint.
+    RefreshToken {
+        client_id: String,
+        client_secret: String,
+        refresh_token: String,
+    },
+    /// Workload Identity Federation: run `command` for a JWT, trade it at STS.
+    Federated {
+        command: String,
+        audience: String,
+        subject_token_type: String,
+        token_url: String,
+    },
 }
 
 #[derive(Deserialize)]
@@ -58,9 +107,7 @@ struct TokenResponse {
 /// extra round trip to Google's token endpoint each time.
 pub struct VertexCredentials {
     path: PathBuf,
-    client_id: String,
-    client_secret: String,
-    refresh_token: String,
+    grant: Grant,
     http: reqwest::Client,
     /// Expiry in wall-clock time, not `Instant`: on macOS `Instant` stops while
     /// the machine sleeps, so a token cached before a long lid-close still
@@ -92,7 +139,7 @@ impl VertexCredentials {
                 e
             )
         })?;
-        check_kind(&file)?;
+        let grant = grant_for(file)?;
 
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(20))
@@ -101,9 +148,7 @@ impl VertexCredentials {
 
         Ok(Self {
             path,
-            client_id: file.client_id,
-            client_secret: file.client_secret,
-            refresh_token: file.refresh_token,
+            grant,
             http,
             cached: Mutex::new(None),
         })
@@ -144,12 +189,37 @@ impl VertexCredentials {
             }
         }
 
-        let request = self.http.post(TOKEN_URL).form(&[
-            ("grant_type", "refresh_token"),
-            ("client_id", self.client_id.as_str()),
-            ("client_secret", self.client_secret.as_str()),
-            ("refresh_token", self.refresh_token.as_str()),
-        ]);
+        let request = match &self.grant {
+            Grant::RefreshToken {
+                client_id,
+                client_secret,
+                refresh_token,
+            } => self.http.post(TOKEN_URL).form(&[
+                ("grant_type", "refresh_token"),
+                ("client_id", client_id.as_str()),
+                ("client_secret", client_secret.as_str()),
+                ("refresh_token", refresh_token.as_str()),
+            ]),
+            Grant::Federated {
+                command,
+                audience,
+                subject_token_type,
+                token_url,
+            } => {
+                let subject_token = run_token_command(command)?;
+                self.http.post(token_url.as_str()).form(&[
+                    ("grant_type", "urn:ietf:params:oauth:grant-type:token-exchange"),
+                    ("audience", audience.as_str()),
+                    ("scope", "https://www.googleapis.com/auth/cloud-platform"),
+                    (
+                        "requested_token_type",
+                        "urn:ietf:params:oauth:token-type:access_token",
+                    ),
+                    ("subject_token_type", subject_token_type.as_str()),
+                    ("subject_token", subject_token.as_str()),
+                ])
+            }
+        };
         let path = self.path.clone();
         let response: TokenResponse = super::block_on(async move {
             let response = request
@@ -193,7 +263,7 @@ impl VertexCredentials {
     }
 }
 
-fn check_kind(file: &CredentialsFile) -> Result<()> {
+fn grant_for(file: CredentialsFile) -> Result<Grant> {
     match file.kind.as_str() {
         "authorized_user" => {
             if file.client_id.is_empty()
@@ -204,13 +274,71 @@ fn check_kind(file: &CredentialsFile) -> Result<()> {
                     "Vertex credentials file is missing client_id, client_secret or refresh_token"
                 ));
             }
-            Ok(())
+            Ok(Grant::RefreshToken {
+                client_id: file.client_id,
+                client_secret: file.client_secret,
+                refresh_token: file.refresh_token,
+            })
+        }
+        "external_account" => {
+            let command = file
+                .credential_source
+                .and_then(|source| source.executable)
+                .map(|executable| executable.command)
+                .filter(|command| !command.trim().is_empty())
+                .ok_or_else(|| {
+                    anyhow!("Only executable-sourced external_account credentials are supported")
+                })?;
+            if file.audience.is_empty() || file.token_url.is_empty() {
+                return Err(anyhow!(
+                    "external_account credentials file is missing audience or token_url"
+                ));
+            }
+            Ok(Grant::Federated {
+                command,
+                audience: file.audience,
+                subject_token_type: if file.subject_token_type.is_empty() {
+                    "urn:ietf:params:oauth:token-type:jwt".to_string()
+                } else {
+                    file.subject_token_type
+                },
+                token_url: file.token_url,
+            })
         }
         "service_account" => Err(anyhow!(
-            "Service-account credentials are not supported; use the file `gcloud auth application-default login` writes"
+            "Service-account key files are not supported; use an external_account (Workload Identity Federation) file"
         )),
         other => Err(anyhow!("Unsupported Vertex credentials type '{}'", other)),
     }
+}
+
+/// Run the credential's executable and return the JWT it prints.
+fn run_token_command(command: &str) -> Result<String> {
+    let mut parts = command.split_whitespace();
+    let program = parts
+        .next()
+        .ok_or_else(|| anyhow!("empty credential command"))?;
+    let output = std::process::Command::new(expand_home(program))
+        .args(parts)
+        .output()
+        .map_err(|e| anyhow!("Could not run the credential command {}: {}", program, e))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "Credential command {} failed: {}",
+            program,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let parsed: ExecutableOutput = serde_json::from_slice(&output.stdout)
+        .map_err(|e| anyhow!("Credential command {} printed something unexpected: {}", program, e))?;
+    if !parsed.success || parsed.id_token.is_empty() {
+        return Err(anyhow!(
+            "Credential command {} reported failure: {}",
+            program,
+            parsed.message
+        ));
+    }
+    Ok(parsed.id_token)
 }
 
 fn expand_home(path: &str) -> PathBuf {
@@ -235,20 +363,50 @@ mod tests {
         let file = parse(
             r#"{"type":"authorized_user","client_id":"c","client_secret":"s","refresh_token":"r"}"#,
         );
-        assert!(check_kind(&file).is_ok());
+        assert!(matches!(grant_for(file), Ok(Grant::RefreshToken { .. })));
+    }
+
+    #[test]
+    fn an_executable_external_account_file_is_accepted() {
+        let file = parse(
+            r#"{"type":"external_account","audience":"//iam.googleapis.com/x","token_url":"https://sts.googleapis.com/v1/token",
+                "subject_token_type":"urn:ietf:params:oauth:token-type:jwt",
+                "credential_source":{"executable":{"command":"~/mint-jwt","timeout_millis":10000}}}"#,
+        );
+        match grant_for(file) {
+            Ok(Grant::Federated { command, audience, .. }) => {
+                assert_eq!(command, "~/mint-jwt");
+                assert_eq!(audience, "//iam.googleapis.com/x");
+            }
+            _ => panic!("expected a federated grant"),
+        }
+    }
+
+    #[test]
+    fn an_external_account_without_an_executable_is_refused() {
+        let file = parse(
+            r#"{"type":"external_account","audience":"a","token_url":"t","credential_source":{"file":"/tmp/x"}}"#,
+        );
+        assert!(grant_for(file).is_err());
     }
 
     #[test]
     fn a_service_account_file_is_refused_with_a_reason() {
         let file = parse(r#"{"type":"service_account","private_key":"…"}"#);
-        let error = check_kind(&file).unwrap_err().to_string();
+        let error = grant_for(file).err().unwrap().to_string();
         assert!(error.contains("not supported"), "{error}");
     }
 
     #[test]
     fn a_file_without_a_refresh_token_is_refused() {
         let file = parse(r#"{"type":"authorized_user","client_id":"c","client_secret":"s"}"#);
-        assert!(check_kind(&file).is_err());
+        assert!(grant_for(file).is_err());
+    }
+
+    #[test]
+    fn a_failing_credential_command_surfaces_its_message() {
+        let error = run_token_command("/usr/bin/false").unwrap_err().to_string();
+        assert!(error.contains("failed"), "{error}");
     }
 
     #[test]

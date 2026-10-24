@@ -1242,10 +1242,11 @@ connection: GeminiConnection;
  */
 vertex_project: string; 
 /**
- * Vertex only: path to an OAuth credentials file of type
- * `authorized_user` — what `gcloud auth application-default login`
- * writes. A path, not the secret itself, so the refresh token never
- * lands in `settings_store.json`. `~` is expanded.
+ * Vertex only: path to a credentials file — `external_account`
+ * (Workload Identity Federation; never expires) or `authorized_user`
+ * (what `gcloud auth application-default login` writes). A path, not
+ * the secret itself, so no secret lands in `settings_store.json`.
+ * `~` is expanded.
  */
 vertex_credentials: string }
 export type GpuDeviceOption = { id: string; name: string; total_vram_mb: number }

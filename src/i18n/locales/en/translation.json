@@ -244,7 +244,7 @@
         "vertexProject": "Project ID",
         "vertexProjectHint": "The Google Cloud project ID (not its name) with the Vertex AI API enabled.",
         "vertexCredentials": "Credentials file",
-        "vertexCredentialsHint": "Path to the file `gcloud auth application-default login` writes. Only the path is stored here, never the token.",
+        "vertexCredentialsHint": "Path to a Workload Identity Federation file (never expires) or the one `gcloud auth application-default login` writes (expires daily on Workspace accounts). Only the path is stored here.",
         "apiKey": "API key",
         "apiKeyHint": "From Google AI Studio. Stored locally and never committed; audio is sent to Google while this model is selected.",
         "mode": "Mode",
